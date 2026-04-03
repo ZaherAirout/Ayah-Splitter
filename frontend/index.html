@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ayah Splitter - Quran Audio Timing Tool</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Ayah Splitter</h1>
+    <p class="subtitle">Generate ayah timing databases for Quran Android</p>
+  </header>
+
+  <main>
+    <!-- Step 1: Upload -->
+    <section id="upload-section" class="card">
+      <h2>1. Upload Audio Files</h2>
+      <p>Upload MP3 files numbered 1-114 (one per surah) or select individual files.</p>
+
+      <div class="upload-area" id="drop-zone">
+        <div class="upload-icon">&#128190;</div>
+        <p>Drag & drop MP3 files here, or click to browse</p>
+        <input type="file" id="file-input" multiple accept=".mp3" hidden>
+        <button class="btn" onclick="document.getElementById('file-input').click()">Select Files</button>
+      </div>
+
+      <div id="upload-status" class="status-bar hidden">
+        <span id="upload-count">0 files uploaded</span>
+        <button class="btn btn-sm" id="btn-list-uploaded" onclick="listUploaded()">Refresh List</button>
+      </div>
+
+      <div id="uploaded-list" class="file-list hidden"></div>
+    </section>
+
+    <!-- Step 2: Analyze -->
+    <section id="analyze-section" class="card">
+      <h2>2. Analyze</h2>
+      <div class="actions">
+        <button class="btn btn-primary" id="btn-analyze-all" onclick="analyzeAll()">Analyze All Surahs</button>
+        <button class="btn btn-sm" id="btn-preferences" onclick="togglePreferences()">Preferences</button>
+      </div>
+
+      <!-- Collapsible preferences -->
+      <div id="preferences-panel" class="preferences-panel hidden">
+        <div class="settings-grid">
+          <div class="setting">
+            <label for="min-silence-len">Min Silence Length (ms)</label>
+            <input type="number" id="min-silence-len" value="120" min="50" max="2000" step="10">
+            <small>Minimum duration to detect as silence</small>
+          </div>
+          <div class="setting">
+            <label for="silence-thresh">Silence Threshold (dB relative)</label>
+            <input type="number" id="silence-thresh" value="-10" min="-20" max="-4" step="1">
+            <small>Relative to audio loudness (auto-tuned by default)</small>
+          </div>
+        </div>
+      </div>
+
+      <div id="analysis-progress" class="hidden">
+        <div class="progress-bar"><div class="progress-fill" id="analysis-fill"></div></div>
+        <span id="analysis-status-text"></span>
+      </div>
+    </section>
+
+    <!-- Step 3: Review & Edit -->
+    <section id="editor-section" class="card">
+      <h2>3. Review & Edit Timings</h2>
+
+      <div class="surah-selector">
+        <label for="surah-select">Select Surah:</label>
+        <select id="surah-select" onchange="loadSurah(this.value)">
+          <option value="">-- Select a surah --</option>
+        </select>
+        <button class="btn btn-primary" id="btn-analyze-surah" onclick="analyzeCurrent()" disabled>Analyze</button>
+      </div>
+
+      <div id="editor-content" class="hidden">
+        <div class="editor-info">
+          <span id="editor-surah-name"></span>
+          <span id="editor-ayah-count"></span>
+          <span id="editor-duration"></span>
+          <span id="editor-basmallah" class="basmallah-badge"></span>
+        </div>
+
+        <!-- Waveform + Markers -->
+        <div id="waveform-container">
+          <canvas id="waveform-canvas"></canvas>
+          <div id="markers-overlay"></div>
+          <div id="playhead" class="playhead"></div>
+        </div>
+
+        <!-- Audio Player -->
+        <div class="audio-controls">
+          <audio id="audio-player" preload="auto"></audio>
+          <button class="btn btn-sm" onclick="togglePlay()" id="btn-play">Play</button>
+          <button class="btn btn-sm" onclick="stopAudio()">Stop</button>
+          <span id="audio-time">0:00 / 0:00</span>
+          <label class="playback-speed">
+            Speed:
+            <select id="playback-speed" onchange="setPlaybackSpeed(this.value)">
+              <option value="0.5">0.5x</option>
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1x</option>
+              <option value="1.25">1.25x</option>
+              <option value="1.5">1.5x</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- Timing Table -->
+        <div class="timing-table-wrapper">
+          <table id="timing-table">
+            <thead>
+              <tr>
+                <th class="col-ayah">Ayah</th>
+                <th class="col-text">Text</th>
+                <th class="col-time">Time (ms)</th>
+                <th class="col-formatted">Time</th>
+                <th class="col-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="timing-tbody"></tbody>
+          </table>
+        </div>
+
+        <div class="actions">
+          <button class="btn" onclick="saveTiming()">Save Changes</button>
+          <button class="btn" onclick="reanalyze()">Re-analyze</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 4: Export -->
+    <section id="export-section" class="card">
+      <h2>4. Export Database</h2>
+      <div class="settings-grid">
+        <div class="setting">
+          <label for="db-name">Database Name</label>
+          <input type="text" id="db-name" value="gapless_timing" placeholder="e.g., gapless_timing">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary" onclick="exportDb()">Export .db.zip</button>
+        <button class="btn" id="btn-download" onclick="downloadExport()" disabled>Download</button>
+      </div>
+      <div id="export-status" class="hidden"></div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Ayah Splitter - Compatible with <a href="https://github.com/quran/quran_android">quran_android</a></p>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

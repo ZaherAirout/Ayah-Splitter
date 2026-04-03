@@ -1,0 +1,18 @@
+services:
+  ayah-splitter:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./audio_input:/data/uploads
+      - ./output:/data/output
+      # Cache Whisper model so it persists across restarts
+      - whisper_cache:/root/.cache
+    environment:
+      - FLASK_DEBUG=0
+      - PORT=8080
+      - WHISPER_MODEL=small
+    restart: unless-stopped
+
+volumes:
+  whisper_cache:

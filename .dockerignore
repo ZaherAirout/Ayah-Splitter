@@ -1,0 +1,6 @@
+audio_input/
+output/
+__pycache__/
+*.pyc
+.git/
+.env
