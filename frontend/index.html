@@ -64,6 +64,22 @@
           <span id="editor-basmallah" class="basmallah-badge"></span>
         </div>
 
+        <div class="detection-controls">
+          <label>Opening:
+            <select id="basmallah-mode" onchange="onBasmallahModeChange()">
+              <option value="auto">Auto detect</option>
+              <option value="present">Opening is Basmallah</option>
+              <option value="absent">Opening is Ayah 1</option>
+            </select>
+          </label>
+          <label id="manual-basmallah-wrap" class="hidden">Ayah 1 starts at:
+            <input type="number" id="manual-basmallah-end" min="0" step="100" placeholder="auto"> ms
+          </label>
+          <button class="btn btn-sm" id="btn-use-playhead" onclick="usePlayheadForBasmallah()" disabled>Use Playhead</button>
+          <button class="btn btn-sm hidden" id="btn-clear-basmallah" onclick="clearBasmallahManual()">Clear</button>
+          <small class="detection-help">Use this when the opening is misdetected.</small>
+        </div>
+
         <!-- Trim Controls -->
         <div class="trim-controls">
           <label>Trim start:

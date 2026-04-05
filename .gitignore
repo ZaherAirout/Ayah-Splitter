@@ -7,3 +7,4 @@ output/
 *.db
 *.db.zip
 .DS_Store
+.idea

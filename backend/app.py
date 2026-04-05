@@ -122,11 +122,18 @@ def analyze(surah_number):
     params = request.get_json(silent=True) or {}
     trim_start = params.get("trim_start_ms", 0)
     trim_end = params.get("trim_end_ms", 0)
+    basmallah_mode = params.get("basmallah_mode", "auto")
+    manual_basmallah_end_ms = params.get("manual_basmallah_end_ms")
+
+    if basmallah_mode not in {"auto", "present", "absent"}:
+        return jsonify({"error": "Invalid basmallah_mode"}), 400
 
     try:
         result = analyze_surah(
             filepath, surah_number,
             trim_start_ms=trim_start, trim_end_ms=trim_end,
+            basmallah_mode=basmallah_mode,
+            manual_basmallah_end_ms=manual_basmallah_end_ms,
         )
         session_timings[surah_number] = result["timings"]
         text = get_surah_text(surah_number)
@@ -141,6 +148,8 @@ def analyze(surah_number):
             "ayah_text": text,
             "basmallah_detected": result.get("basmallah_detected"),
             "basmallah_transcription": result.get("basmallah_transcription"),
+            "basmallah_method": result.get("basmallah_method"),
+            "basmallah_confidence": result.get("basmallah_confidence"),
         })
     except Exception as e:
         traceback.print_exc()

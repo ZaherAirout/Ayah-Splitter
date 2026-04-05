@@ -10,10 +10,12 @@ Strategy (in order of priority):
 """
 
 import logging
+import re
 import numpy as np
 from pydub import AudioSegment
 from pydub.silence import detect_silence
-from quran_metadata import AYAH_COUNTS, NO_BASMALLAH, SURAH_AVG_WORDS_PER_AYAH
+from quran_metadata import AYAH_COUNTS, NO_BASMALLAH
+from quran_text import get_surah_text
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +28,43 @@ _AYAH_WORD_COUNTS: dict[int, list[int]] = {
     1: [4, 4, 2, 2, 4, 3, 9],  # Al-Fatiha
 }
 
+_WORD_RE = re.compile(r"[0-9A-Za-z\u0621-\u063a\u0641-\u064a]+")
+
 
 def load_audio(filepath: str) -> AudioSegment:
     return AudioSegment.from_mp3(filepath)
+
+
+def _safe_dbfs(audio: AudioSegment) -> float:
+    dbfs = audio.dBFS
+    if len(audio) == 0 or dbfs == float("-inf"):
+        return -120.0
+    return dbfs
+
+
+def _merge_close_silences(
+    audio: AudioSegment,
+    silences: list[tuple[int, int]],
+    max_gap_ms: int = 120,
+) -> list[tuple[int, int]]:
+    """Merge silence spans that are only split by a tiny, low-energy bridge."""
+    if not silences:
+        return []
+
+    merged = [[silences[0][0], silences[0][1]]]
+    audio_dbfs = _safe_dbfs(audio)
+
+    for start, end in silences[1:]:
+        prev = merged[-1]
+        gap = start - prev[1]
+        if gap <= max_gap_ms:
+            bridge = audio[prev[1]:start]
+            if gap <= 35 or _safe_dbfs(bridge) <= audio_dbfs + 3:
+                prev[1] = max(prev[1], end)
+                continue
+        merged.append([start, end])
+
+    return [(start, end) for start, end in merged]
 
 
 def _detect_silences(audio: AudioSegment, num_ayahs: int) -> list[tuple[int, int]]:
@@ -74,7 +110,26 @@ def _detect_silences(audio: AudioSegment, num_ayahs: int) -> list[tuple[int, int
             audio, min_silence_len=80, silence_thresh=audio_dbfs - 5, seek_step=seek_step
         )
 
-    return best_silences
+    return _merge_close_silences(audio, best_silences)
+
+
+def _count_ayah_words(text: str) -> int:
+    return len(_WORD_RE.findall(text or ""))
+
+
+def _get_text_word_counts(surah_number: int) -> list[int] | None:
+    """Use actual ayah text when available so long ayahs get proportionally more time."""
+    num_ayahs = AYAH_COUNTS[surah_number]
+    text = get_surah_text(surah_number)
+
+    if not text or len(text) != num_ayahs:
+        return None
+
+    counts = [max(1, _count_ayah_words(text.get(ayah, ""))) for ayah in range(1, num_ayahs + 1)]
+    if sum(counts) <= num_ayahs:
+        return None
+
+    return counts
 
 
 def _get_ayah_weights(surah_number: int) -> list[float]:
@@ -83,6 +138,11 @@ def _get_ayah_weights(surah_number: int) -> list[float]:
     Longer ayahs get proportionally more audio time.
     """
     num_ayahs = AYAH_COUNTS[surah_number]
+
+    text_counts = _get_text_word_counts(surah_number)
+    if text_counts:
+        total = sum(text_counts)
+        return [count / total for count in text_counts]
 
     if surah_number in _AYAH_WORD_COUNTS:
         words = _AYAH_WORD_COUNTS[surah_number]
@@ -108,7 +168,7 @@ def _estimate_positions(
     Returns `num_splits` timestamps between content_start and content_end.
     """
     duration = content_end_ms - content_start_ms
-    if weights and len(weights) >= num_splits + 1:
+    if weights and len(weights) >= num_splits:
         # Cumulative sum of weights gives split positions
         positions = []
         cumsum = 0.0
@@ -120,6 +180,41 @@ def _estimate_positions(
         # Equal spacing fallback
         step = duration / (num_splits + 1)
         return [content_start_ms + int(step * (i + 1)) for i in range(num_splits)]
+
+
+def _get_boundary_search_range(
+    content_start_ms: int,
+    content_end_ms: int,
+    num_ayahs: int,
+) -> int:
+    span_ms = max(1, content_end_ms - content_start_ms)
+    avg_ayah_ms = span_ms / max(1, num_ayahs)
+    return int(max(900, min(3500, avg_ayah_ms * 0.45)))
+
+
+def _find_opening_boundary_candidate(
+    silences: list[tuple[int, int]],
+    effective_start_ms: int,
+    effective_end_ms: int,
+) -> int | None:
+    """Fallback for manually-forced basmallah mode when the model cannot place ayah 1."""
+    window_end = min(effective_end_ms - 300, effective_start_ms + 8000)
+    candidates = []
+
+    for start, end in silences:
+        duration = end - start
+        midpoint = (start + end) // 2
+        if start < effective_start_ms + 1200 or end > window_end or duration < 120:
+            continue
+
+        score = (duration * 1.6) - max(0, midpoint - (effective_start_ms + 4500)) * 0.04
+        candidates.append((score, midpoint))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 def _snap_to_silences(
@@ -184,13 +279,14 @@ def estimate_ayah_splits(
     num_ayahs = AYAH_COUNTS[surah_number]
     effective_start = trim_start_ms
     effective_end = audio_duration_ms - trim_end_ms
-    effective_duration = effective_end - effective_start
 
     has_bsm = False
     bsm_end_ms = None
+    bsm_method = None
     if basmallah_info and basmallah_info.get("has_basmallah"):
         has_bsm = True
         bsm_end_ms = basmallah_info.get("basmallah_end_ms")
+        bsm_method = basmallah_info.get("method")
 
     # Filter silences to effective range
     eff_silences = [
@@ -202,14 +298,19 @@ def estimate_ayah_splits(
     timings.append({"ayah": 0, "time": effective_start})
 
     weights = _get_ayah_weights(surah_number)
+    boundary_search_range_ms = _get_boundary_search_range(
+        effective_start, effective_end, num_ayahs
+    )
 
     if surah_number == 1:
         # Al-Fatiha: Basmallah IS ayah 1
         timings.append({"ayah": 1, "time": effective_start})
         estimates = _estimate_positions(
-            num_ayahs - 1, effective_start, effective_end, weights[1:]
+            num_ayahs - 1, effective_start, effective_end, weights
         )
-        snapped = _snap_to_silences(estimates, eff_silences)
+        snapped = _snap_to_silences(
+            estimates, eff_silences, search_range_ms=boundary_search_range_ms
+        )
         # Enforce: each split > previous
         prev = effective_start
         for i, t in enumerate(snapped):
@@ -221,9 +322,11 @@ def estimate_ayah_splits(
         # Surah 9: no Basmallah
         timings.append({"ayah": 1, "time": effective_start})
         estimates = _estimate_positions(
-            num_ayahs - 1, effective_start, effective_end, weights[1:]
+            num_ayahs - 1, effective_start, effective_end, weights
         )
-        snapped = _snap_to_silences(estimates, eff_silences)
+        snapped = _snap_to_silences(
+            estimates, eff_silences, search_range_ms=boundary_search_range_ms
+        )
         prev = effective_start
         for i, t in enumerate(snapped):
             t = max(t, prev + 100)
@@ -234,9 +337,12 @@ def estimate_ayah_splits(
         # Reciter says Basmallah before ayah 1
         ayah1_start = bsm_end_ms or effective_start
         ayah1_start = max(ayah1_start, effective_start)
-        # Snap to nearest silence
-        candidates = [(s, e) for s, e in eff_silences if s > effective_start + 1000]
-        if candidates:
+        # Snap AI-estimated boundaries to the nearest silence, but keep manual values exact.
+        candidates = [
+            (s, e) for s, e in eff_silences
+            if s > effective_start + 600 and abs(((s + e) // 2) - ayah1_start) <= boundary_search_range_ms
+        ]
+        if candidates and bsm_method != "manual":
             mids = [((s + e) // 2, e - s) for s, e in candidates]
             # Find closest to estimated basmallah end
             mids.sort(key=lambda m: abs(m[0] - ayah1_start) - m[1] * 0.2)
@@ -247,9 +353,11 @@ def estimate_ayah_splits(
         # Split remaining audio into num_ayahs-1 inter-ayah boundaries
         remaining_silences = [(s, e) for s, e in eff_silences if s > ayah1_start]
         estimates = _estimate_positions(
-            num_ayahs - 1, ayah1_start, effective_end, weights[1:]
+            num_ayahs - 1, ayah1_start, effective_end, weights
         )
-        snapped = _snap_to_silences(estimates, remaining_silences)
+        snapped = _snap_to_silences(
+            estimates, remaining_silences, search_range_ms=boundary_search_range_ms
+        )
         prev = ayah1_start
         for i, t in enumerate(snapped):
             t = max(t, prev + 100)
@@ -260,9 +368,11 @@ def estimate_ayah_splits(
         # No Basmallah detected
         timings.append({"ayah": 1, "time": effective_start})
         estimates = _estimate_positions(
-            num_ayahs - 1, effective_start, effective_end, weights[1:]
+            num_ayahs - 1, effective_start, effective_end, weights
         )
-        snapped = _snap_to_silences(estimates, eff_silences)
+        snapped = _snap_to_silences(
+            estimates, eff_silences, search_range_ms=boundary_search_range_ms
+        )
         prev = effective_start
         for i, t in enumerate(snapped):
             t = max(t, prev + 100)
@@ -292,6 +402,8 @@ def analyze_surah(
     surah_number: int,
     trim_start_ms: int = 0,
     trim_end_ms: int = 0,
+    basmallah_mode: str = "auto",
+    manual_basmallah_end_ms: int | None = None,
     **kwargs,
 ) -> dict:
     """
@@ -305,6 +417,13 @@ def analyze_surah(
     audio = load_audio(filepath)
     duration_ms = len(audio)
     num_ayahs = AYAH_COUNTS[surah_number]
+    effective_end_ms = max(trim_start_ms, duration_ms - trim_end_ms)
+
+    if manual_basmallah_end_ms is not None:
+        manual_basmallah_end_ms = max(
+            trim_start_ms,
+            min(manual_basmallah_end_ms, max(trim_start_ms, effective_end_ms - 100)),
+        )
 
     silences = _detect_silences(audio, num_ayahs=num_ayahs)
 
@@ -313,11 +432,42 @@ def analyze_surah(
     if surah_number not in NO_BASMALLAH:
         try:
             from basmallah_detector import detect_basmallah
-            basmallah_info = detect_basmallah(audio)
+
+            if basmallah_mode == "absent":
+                basmallah_info = {
+                    "has_basmallah": False,
+                    "transcription": "",
+                    "basmallah_end_ms": None,
+                    "confidence": 1.0,
+                    "method": "manual-absent",
+                }
+            else:
+                detected = detect_basmallah(audio, surah_number=surah_number)
+                if basmallah_mode == "present":
+                    boundary = manual_basmallah_end_ms
+                    if boundary is None:
+                        boundary = detected.get("basmallah_end_ms") or _find_opening_boundary_candidate(
+                            silences, trim_start_ms, effective_end_ms
+                        )
+
+                    basmallah_info = {
+                        "has_basmallah": True,
+                        "transcription": detected.get("transcription", ""),
+                        "basmallah_end_ms": boundary,
+                        "confidence": 1.0 if manual_basmallah_end_ms is not None else max(
+                            detected.get("confidence", 0.0),
+                            0.55 if boundary is not None else 0.4,
+                        ),
+                        "method": "manual" if manual_basmallah_end_ms is not None else "manual-present",
+                    }
+                else:
+                    basmallah_info = detected
+
             logger.info(
                 f"Surah {surah_number}: bsm={'YES' if basmallah_info['has_basmallah'] else 'NO'}"
                 f" end={basmallah_info.get('basmallah_end_ms')}ms"
                 f" method={basmallah_info.get('method')}"
+                f" mode={basmallah_mode}"
             )
         except Exception as e:
             logger.warning(f"Basmallah detection failed for surah {surah_number}: {e}")
@@ -335,6 +485,8 @@ def analyze_surah(
         "num_ayahs": num_ayahs,
         "basmallah_detected": basmallah_info["has_basmallah"] if basmallah_info else None,
         "basmallah_transcription": basmallah_info.get("transcription") if basmallah_info else None,
+        "basmallah_method": basmallah_info.get("method") if basmallah_info else None,
+        "basmallah_confidence": basmallah_info.get("confidence") if basmallah_info else None,
     }
 
 

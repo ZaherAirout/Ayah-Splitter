@@ -10,6 +10,12 @@ import os
 _TEXT_CACHE: dict[int, dict[int, str]] = {}
 _LOADED = False
 
+_LEADING_BASMALLAH_PREFIXES = [
+    "\u0628\u0650\u0633\u0652\u0645\u0650 \u0671\u0644\u0644\u0651\u064e\u0647\u0650 \u0671\u0644\u0631\u0651\u064e\u062d\u0652\u0645\u064e\u0670\u0646\u0650 \u0671\u0644\u0631\u0651\u064e\u062d\u0650\u064a\u0645\u0650",
+    "\u0628\u0650\u0633\u0652\u0645\u0650 \u0627\u0644\u0644\u0651\u064e\u0647\u0650 \u0627\u0644\u0631\u0651\u064e\u062d\u0652\u0645\u064e\u0670\u0646\u0650 \u0627\u0644\u0631\u0651\u064e\u062d\u0650\u064a\u0645\u0650",
+    "\u0628\u0633\u0645 \u0627\u0644\u0644\u0647 \u0627\u0644\u0631\u062d\u0645\u0646 \u0627\u0644\u0631\u062d\u064a\u0645",
+]
+
 
 # Built-in text for commonly tested surahs
 _BUILTIN_TEXT = {
@@ -71,6 +77,20 @@ _BUILTIN_TEXT = {
 }
 
 
+def _strip_leading_basmallah(surah_num: int, ayah_num: int, text: str) -> str:
+    """Remove a duplicated basmallah prefix for non-Fatihah/non-Tawbah ayah 1 text."""
+    if surah_num in (1, 9) or ayah_num != 1 or not text:
+        return text
+
+    for prefix in _LEADING_BASMALLAH_PREFIXES:
+        if text.startswith(prefix):
+            stripped = text[len(prefix):].lstrip()
+            if stripped:
+                return stripped
+
+    return text
+
+
 def _load_text():
     """Load Quran text from JSON file or use built-in fallback."""
     global _TEXT_CACHE, _LOADED
@@ -87,7 +107,8 @@ def _load_text():
             for surah_str, ayahs in data.items():
                 surah_num = int(surah_str)
                 _TEXT_CACHE[surah_num] = {
-                    int(ayah_str): text for ayah_str, text in ayahs.items()
+                    int(ayah_str): _strip_leading_basmallah(surah_num, int(ayah_str), text)
+                    for ayah_str, text in ayahs.items()
                 }
     else:
         _TEXT_CACHE.update(_BUILTIN_TEXT)

@@ -63,6 +63,13 @@ main { max-width: 1100px; margin: 0 auto; padding: 1rem; display: flex; flex-dir
 /* Editor info */
 .editor-info { display: flex; gap: 1.2rem; margin-bottom: 0.6rem; font-size: 0.82rem; color: var(--text-dim); flex-wrap: wrap; }
 
+/* Detection controls */
+.detection-controls { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.7rem; padding: 0.65rem 0.8rem; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); font-size: 0.8rem; flex-wrap: wrap; }
+.detection-controls label { display: inline-flex; align-items: center; gap: 0.35rem; color: var(--text-dim); }
+.detection-controls select, .detection-controls input { padding: 0.28rem 0.45rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); font-size: 0.82rem; }
+.detection-controls input { width: 110px; }
+.detection-help { color: var(--text-dim); }
+
 /* Trim Controls */
 .trim-controls { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; flex-wrap: wrap; }
 .trim-controls label { display: flex; align-items: center; gap: 0.3rem; color: var(--text-dim); }
@@ -147,3 +154,9 @@ footer a { color: var(--primary); text-decoration: none; }
 .toast.error { background: #c0392b; }
 .toast.info { background: #2d6da5; }
 @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+@media (max-width: 720px) {
+  .detection-controls { align-items: stretch; }
+  .detection-controls label { width: 100%; }
+  .detection-help { width: 100%; }
+}

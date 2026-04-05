@@ -108,6 +108,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupDropZone();
   setupAudioEvents();
   setupWaveformInteraction();
+  onBasmallahModeChange();
   updateSavedSummary();
 });
 
@@ -224,6 +225,9 @@ async function loadSurah(surahNum) {
   trimStartMs = 0; trimEndMs = 0;
   document.getElementById('trim-start').value = 0;
   document.getElementById('trim-end').value = 0;
+  document.getElementById('basmallah-mode').value = 'auto';
+  document.getElementById('manual-basmallah-end').value = '';
+  onBasmallahModeChange();
 
   // Check if we have saved timings in localStorage
   const saved = loadAllTimingsFromLocal()[surahNum];
@@ -275,12 +279,30 @@ async function analyzeCurrent() {
   btn.disabled = true; btn.textContent = 'Analyzing...';
   setFileStatus(currentSurah, 'analyzing');
 
+  const basmallahMode = document.getElementById('basmallah-mode').value || 'auto';
+  const manualBasmallahValue = document.getElementById('manual-basmallah-end').value;
+  const manualBasmallahEndMs = manualBasmallahValue === '' ? null : parseInt(manualBasmallahValue, 10);
+
   try {
     const res = await fetch(`${API}/api/analyze/${currentSurah}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ trim_start_ms: trimStartMs, trim_end_ms: trimEndMs }),
+      body: JSON.stringify({
+        trim_start_ms: trimStartMs,
+        trim_end_ms: trimEndMs,
+        basmallah_mode: basmallahMode,
+        manual_basmallah_end_ms: manualBasmallahEndMs,
+      }),
     });
-    if (!res.ok) { showToast('Analysis failed', 'error'); setFileStatus(currentSurah, 'uploaded'); return; }
+    if (!res.ok) {
+      let message = 'Analysis failed';
+      try {
+        const err = await res.json();
+        if (err.error) message = err.error;
+      } catch {}
+      showToast(message, 'error');
+      setFileStatus(currentSurah, 'uploaded');
+      return;
+    }
 
     const d = await res.json();
     currentTimings = d.timings; currentSilences = d.silences || []; currentAyahText = d.ayah_text || {};
@@ -295,8 +317,17 @@ async function analyzeCurrent() {
     }
 
     const badge = document.getElementById('editor-basmallah');
-    if (d.basmallah_detected === true) { badge.textContent = 'Basmallah detected'; badge.className = 'basmallah-badge detected'; }
-    else if (d.basmallah_detected === false) { badge.textContent = 'No Basmallah'; badge.className = 'basmallah-badge not-detected'; }
+    if (d.basmallah_detected === true) {
+      badge.textContent = d.basmallah_method && d.basmallah_method.startsWith('manual')
+        ? 'Basmallah forced'
+        : 'Basmallah detected';
+      badge.className = 'basmallah-badge detected';
+    } else if (d.basmallah_detected === false) {
+      badge.textContent = d.basmallah_method === 'manual-absent'
+        ? 'No Basmallah (manual)'
+        : 'No Basmallah';
+      badge.className = 'basmallah-badge not-detected';
+    }
 
     setFileStatus(currentSurah, 'analyzed');
     renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays();
@@ -335,6 +366,30 @@ function onTrimChange() {
   trimStartMs = parseInt(document.getElementById('trim-start').value) || 0;
   trimEndMs = parseInt(document.getElementById('trim-end').value) || 0;
   updateTrimOverlays();
+}
+
+function onBasmallahModeChange() {
+  const mode = document.getElementById('basmallah-mode').value || 'auto';
+  const wrap = document.getElementById('manual-basmallah-wrap');
+  const input = document.getElementById('manual-basmallah-end');
+  const playheadBtn = document.getElementById('btn-use-playhead');
+  const clearBtn = document.getElementById('btn-clear-basmallah');
+  const manual = mode === 'present';
+
+  wrap.classList.toggle('hidden', !manual);
+  playheadBtn.disabled = !manual;
+  clearBtn.classList.toggle('hidden', !manual);
+  input.disabled = !manual;
+  if (!manual) input.value = '';
+}
+
+function usePlayheadForBasmallah() {
+  const input = document.getElementById('manual-basmallah-end');
+  input.value = Math.round(audioPlayer.currentTime * 1000);
+}
+
+function clearBasmallahManual() {
+  document.getElementById('manual-basmallah-end').value = '';
 }
 
 function updateTrimOverlays() {

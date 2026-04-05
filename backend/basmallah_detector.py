@@ -3,6 +3,7 @@
 import os
 import tempfile
 import logging
+import re
 
 from pydub import AudioSegment
 from pydub.silence import detect_silence
@@ -40,8 +41,91 @@ _BASMALLAH_PATTERNS = [
     "bism",
 ]
 
+_ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]")
+_NON_TOKEN_RE = re.compile(r"[^0-9a-z\u0621-\u063a\u0641-\u064a\s]+")
 
-def detect_basmallah(audio: AudioSegment, check_duration_ms: int = 15000) -> dict:
+
+def _normalize_text(text: str) -> str:
+    """Normalize Arabic transcription for keyword and prefix matching."""
+    if not text:
+        return ""
+
+    text = text.lower().replace("اللّه", "الله")
+    text = _ARABIC_DIACRITICS_RE.sub("", text)
+    text = (
+        text.replace("أ", "ا")
+        .replace("إ", "ا")
+        .replace("آ", "ا")
+        .replace("ٱ", "ا")
+        .replace("ؤ", "و")
+        .replace("ئ", "ي")
+        .replace("ى", "ي")
+        .replace("ة", "ه")
+        .replace("ـ", " ")
+    )
+    text = _NON_TOKEN_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def _normalized_tokens(text: str) -> list[str]:
+    tokens = _normalize_text(text).split()
+    while tokens and tokens[0].isdigit():
+        tokens.pop(0)
+    return tokens
+
+
+def _contains_basmallah_phrase(text: str) -> bool:
+    normalized = " ".join(_normalized_tokens(text))
+    return any(_normalize_text(pattern) in normalized for pattern in _BASMALLAH_PATTERNS)
+
+
+def _transcription_starts_like_ayah1(transcription: str, surah_number: int | None) -> bool:
+    """Detect when Whisper clearly starts with ayah 1, which rules out a separate basmallah."""
+    if not surah_number or surah_number == 1:
+        return False
+
+    try:
+        from quran_text import get_ayah_text
+    except Exception:
+        return False
+
+    ayah1_text = get_ayah_text(surah_number, 1)
+    if not ayah1_text:
+        return False
+
+    trans_tokens = _normalized_tokens(transcription)
+    ayah_tokens = _normalized_tokens(ayah1_text)
+    if len(trans_tokens) < 2 or len(ayah_tokens) < 2:
+        return False
+
+    window = min(4, len(trans_tokens), len(ayah_tokens))
+    fuzzy_matches = 0.0
+    for idx in range(window):
+        left = trans_tokens[idx]
+        right = ayah_tokens[idx]
+        if left == right:
+            fuzzy_matches += 1.0
+        elif left.startswith(right) or right.startswith(left):
+            fuzzy_matches += 0.8
+
+    ayah_prefix = " ".join(ayah_tokens[: min(3, len(ayah_tokens))])
+    transcription_prefix = " ".join(trans_tokens[: min(5, len(trans_tokens))])
+
+    return bool(ayah_prefix and ayah_prefix in transcription_prefix) or fuzzy_matches >= max(2.0, window - 0.4)
+
+
+def _safe_dbfs(segment: AudioSegment) -> float:
+    dbfs = segment.dBFS
+    if len(segment) == 0 or dbfs == float("-inf"):
+        return -120.0
+    return dbfs
+
+
+def detect_basmallah(
+    audio: AudioSegment,
+    check_duration_ms: int = 15000,
+    surah_number: int | None = None,
+) -> dict:
     """
     Check if the beginning of an audio clip contains Basmallah recitation.
 
@@ -67,9 +151,21 @@ def detect_basmallah(audio: AudioSegment, check_duration_ms: int = 15000) -> dic
 
     # Strategy 1: Whisper transcription
     whisper_result = _whisper_detect(clip)
+    starts_like_ayah1 = _transcription_starts_like_ayah1(
+        whisper_result["transcription"], surah_number
+    )
 
     if whisper_result["has_basmallah"]:
         return whisper_result
+
+    if starts_like_ayah1:
+        return {
+            "has_basmallah": False,
+            "transcription": whisper_result["transcription"],
+            "basmallah_end_ms": None,
+            "confidence": 0.75,
+            "method": "ayah1_match",
+        }
 
     # Strategy 2: Silence-based heuristic
     # If there's a significant silence in the first 3-10 seconds, it's likely
@@ -105,6 +201,7 @@ def _whisper_detect(clip: AudioSegment) -> dict:
             tmp_path,
             language="ar",
             beam_size=5,
+            condition_on_previous_text=False,
             vad_filter=False,
             word_timestamps=True,
         )
@@ -131,12 +228,7 @@ def _whisper_detect(clip: AudioSegment) -> dict:
         full_text = full_text.strip()
 
         # Check if transcription contains Basmallah
-        has_bsm = False
-        text_lower = full_text.lower().strip()
-        for pattern in _BASMALLAH_PATTERNS:
-            if pattern in text_lower:
-                has_bsm = True
-                break
+        has_bsm = _contains_basmallah_phrase(full_text)
 
         if has_bsm:
             basmallah_end_ms = _find_basmallah_end_from_segments(segments)
@@ -167,12 +259,22 @@ def _heuristic_detect(clip: AudioSegment) -> dict:
     """
     duration_ms = len(clip)
     audio_dbfs = clip.dBFS
+    max_gap_end = min(8000, int(duration_ms * 0.55))
+
+    if max_gap_end < 2400:
+        return {
+            "has_basmallah": False,
+            "transcription": "",
+            "basmallah_end_ms": None,
+            "confidence": 0.0,
+            "method": "none",
+        }
 
     # Try multiple thresholds to find silence gaps
-    for thresh_offset in [-8, -10, -12]:
+    for thresh_offset in [-10, -12, -14]:
         thresh = audio_dbfs + thresh_offset
         silences = detect_silence(
-            clip, min_silence_len=150, silence_thresh=thresh, seek_step=5
+            clip, min_silence_len=180, silence_thresh=thresh, seek_step=5
         )
 
         # Find where leading silence ends
@@ -184,24 +286,31 @@ def _heuristic_detect(clip: AudioSegment) -> dict:
                 break
 
         # Look for inner silences after content starts
-        search_start = content_start + 1500
-        search_end = content_start + 10000
+        search_start = content_start + 1200
+        search_end = content_start + max_gap_end
         inner = []
         for s, e in silences:
             dur = e - s
-            if s >= search_start and s <= search_end and dur >= 150:
+            if s >= search_start and s <= search_end and dur >= 180:
                 inner.append((s, e, dur))
 
         if inner:
-            # Pick the largest silence in this range
-            inner.sort(key=lambda x: x[2], reverse=True)
+            # Prefer longer gaps, but strongly penalize late candidates.
+            inner.sort(
+                key=lambda x: (x[2] * 1.7) - max(0, x[0] - (content_start + 4500)) * 0.05,
+                reverse=True,
+            )
             bsm_gap = inner[0]
             gap_mid = (bsm_gap[0] + bsm_gap[1]) // 2
 
             # Verify there's actual audio content between content_start and the gap
-            if bsm_gap[0] > content_start + 500:
+            if bsm_gap[0] > content_start + 1200:
                 pre_audio = clip[content_start:bsm_gap[0]]
-                if pre_audio.dBFS > audio_dbfs - 15:
+                post_audio = clip[bsm_gap[1]:min(duration_ms, bsm_gap[1] + 1800)]
+                if (
+                    _safe_dbfs(pre_audio) > audio_dbfs - 15
+                    and _safe_dbfs(post_audio) > audio_dbfs - 18
+                ):
                     return {
                         "has_basmallah": True,
                         "transcription": "",
