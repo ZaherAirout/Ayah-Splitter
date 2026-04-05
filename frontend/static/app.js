@@ -1,663 +1,526 @@
-/* Ayah Splitter - Frontend Application */
+/* Ayah Splitter */
+const API = '';
 
-const API = '';  // Same origin
-
-// State
+// ── State ───────────────────────────────────────────────────────────
 let currentSurah = null;
 let currentTimings = [];
 let currentSilences = [];
-let currentAyahText = {};  // {ayah_num: "arabic text"}
+let currentAyahText = {};
 let waveformData = [];
 let durationMs = 0;
 let surahs = [];
+let uploadedFiles = [];
 let dragMarker = null;
+let zoomLevel = 1;
+let trimStartMs = 0;
+let trimEndMs = 0;
 
-// DOM elements
 const audioPlayer = document.getElementById('audio-player');
 const waveformCanvas = document.getElementById('waveform-canvas');
 const markersOverlay = document.getElementById('markers-overlay');
 const playhead = document.getElementById('playhead');
 const ctx = waveformCanvas.getContext('2d');
 
-// ── Initialize ──────────────────────────────────────────────────────
+// ── IndexedDB for audio blobs ───────────────────────────────────────
+const DB_NAME = 'AyahSplitterDB';
+const DB_VERSION = 1;
+const AUDIO_STORE = 'audioFiles';
+
+function openIDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(AUDIO_STORE)) {
+        db.createObjectStore(AUDIO_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveAudioBlob(surahNum, blob) {
+  const db = await openIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(AUDIO_STORE, 'readwrite');
+    tx.objectStore(AUDIO_STORE).put(blob, surahNum);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getAudioBlob(surahNum) {
+  const db = await openIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(AUDIO_STORE, 'readonly');
+    const req = tx.objectStore(AUDIO_STORE).get(surahNum);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function deleteAudioBlob(surahNum) {
+  const db = await openIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(AUDIO_STORE, 'readwrite');
+    tx.objectStore(AUDIO_STORE).delete(surahNum);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function clearAllAudioBlobs() {
+  const db = await openIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(AUDIO_STORE, 'readwrite');
+    tx.objectStore(AUDIO_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ── localStorage helpers ────────────────────────────────────────────
+const LS_KEY = 'ayahSplitter_timings';
+
+function loadAllTimingsFromLocal() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); }
+  catch { return {}; }
+}
+
+function saveTimingsToLocal(surahNum, timings, trim) {
+  const all = loadAllTimingsFromLocal();
+  all[surahNum] = { timings, trim: trim || { start: 0, end: 0 }, savedAt: Date.now() };
+  localStorage.setItem(LS_KEY, JSON.stringify(all));
+}
+
+function getSavedSurahs() {
+  return Object.keys(loadAllTimingsFromLocal()).map(Number).sort((a, b) => a - b);
+}
+
+function clearAllTimingsLocal() {
+  localStorage.removeItem(LS_KEY);
+}
+
+// ── Init ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   await loadMetadata();
   setupDropZone();
   setupAudioEvents();
   setupWaveformInteraction();
+  updateSavedSummary();
 });
 
 async function loadMetadata() {
   const res = await fetch(`${API}/api/metadata`);
   const data = await res.json();
   surahs = data.surahs;
-
-  const select = document.getElementById('surah-select');
-  surahs.forEach(s => {
-    const opt = document.createElement('option');
-    opt.value = s.number;
-    opt.textContent = `${s.number}. ${s.name} (${s.ayah_count} ayahs)`;
-    select.appendChild(opt);
+  ['surah-select', 'upload-surah-select'].forEach(id => {
+    const sel = document.getElementById(id);
+    surahs.forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s.number;
+      opt.textContent = `${s.number}. ${s.name} (${s.ayah_count} ayahs)`;
+      sel.appendChild(opt);
+    });
   });
 }
 
-// ── Preferences Toggle ──────────────────────────────────────────────
-function togglePreferences() {
-  const panel = document.getElementById('preferences-panel');
-  panel.classList.toggle('hidden');
-}
+function togglePreferences() { document.getElementById('preferences-panel').classList.toggle('hidden'); }
 
-// ── File Upload ─────────────────────────────────────────────────────
+// ── Upload ──────────────────────────────────────────────────────────
 function setupDropZone() {
-  const dropZone = document.getElementById('drop-zone');
-  const fileInput = document.getElementById('file-input');
+  const dz = document.getElementById('drop-zone');
+  const fi = document.getElementById('file-input');
+  dz.addEventListener('click', () => fi.click());
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+  dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag-over'); handleFiles(e.dataTransfer.files); });
+  fi.addEventListener('change', () => { handleFiles(fi.files); fi.value = ''; });
+  document.getElementById('single-file-input').addEventListener('change', function() { handleSingleFile(this.files[0]); this.value = ''; });
+}
 
-  dropZone.addEventListener('click', () => fileInput.click());
+async function handleSingleFile(file) {
+  if (!file) return;
+  const surahNum = parseInt(document.getElementById('upload-surah-select').value);
+  if (!surahNum) { showToast('Select a surah first', 'error'); return; }
 
-  dropZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    dropZone.classList.add('drag-over');
-  });
+  // Save to IndexedDB
+  const blob = new Blob([await file.arrayBuffer()], { type: 'audio/mpeg' });
+  await saveAudioBlob(surahNum, blob);
 
-  dropZone.addEventListener('dragleave', () => {
-    dropZone.classList.remove('drag-over');
-  });
-
-  dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('drag-over');
-    handleFiles(e.dataTransfer.files);
-  });
-
-  fileInput.addEventListener('change', () => {
-    handleFiles(fileInput.files);
-    fileInput.value = '';
-  });
+  // Upload to server
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('surah_number', surahNum);
+  const res = await fetch(`${API}/api/upload`, { method: 'POST', body: fd });
+  const data = await res.json();
+  if (data.success) {
+    addUploadedFile(surahNum, data.surah_name, data.size_mb);
+    showToast(`Uploaded ${data.surah_name}`, 'success');
+    // Auto-select in editor
+    document.getElementById('surah-select').value = surahNum;
+    loadSurah(surahNum);
+  } else { showToast(data.error || 'Upload failed', 'error'); }
 }
 
 async function handleFiles(files) {
-  const formData = new FormData();
-  let count = 0;
-
-  for (const file of files) {
-    if (file.name.endsWith('.mp3')) {
-      formData.append('files', file);
-      count++;
+  const fd = new FormData(); let n = 0;
+  for (const f of files) {
+    if (!f.name.endsWith('.mp3')) continue;
+    fd.append('files', f);
+    // Also cache in IndexedDB
+    const base = f.name.replace('.mp3', '');
+    const num = parseInt(base);
+    if (num >= 1 && num <= 114) {
+      const blob = new Blob([await f.arrayBuffer()], { type: 'audio/mpeg' });
+      await saveAudioBlob(num, blob);
     }
+    n++;
   }
-
-  if (count === 0) {
-    showToast('No MP3 files found', 'error');
-    return;
-  }
-
-  showToast(`Uploading ${count} file(s)...`, 'info');
-
-  const res = await fetch(`${API}/api/upload-folder`, {
-    method: 'POST',
-    body: formData,
-  });
-
+  if (!n) { showToast('No MP3 files', 'error'); return; }
+  showToast(`Uploading ${n} file(s)...`, 'info');
+  const res = await fetch(`${API}/api/upload-folder`, { method: 'POST', body: fd });
   const data = await res.json();
-  if (data.success) {
-    showToast(`Uploaded ${data.uploaded_surahs.length} surah(s)`, 'success');
-    document.getElementById('upload-status').classList.remove('hidden');
-    document.getElementById('upload-count').textContent =
-      `${data.uploaded_surahs.length} files uploaded`;
-    listUploaded();
-  } else {
-    showToast(data.error || 'Upload failed', 'error');
-  }
+  if (data.success) { showToast(`Uploaded ${data.uploaded_surahs.length} surah(s)`, 'success'); await refreshUploadedList(); }
 }
 
-async function listUploaded() {
+function addUploadedFile(surah, name, size_mb) {
+  uploadedFiles = uploadedFiles.filter(f => f.surah !== surah);
+  uploadedFiles.push({ surah, name, size_mb, status: 'uploaded' });
+  uploadedFiles.sort((a, b) => a.surah - b.surah);
+  renderUploadedList();
+}
+
+async function refreshUploadedList() {
   const res = await fetch(`${API}/api/uploaded-surahs`);
   const data = await res.json();
-
-  const listEl = document.getElementById('uploaded-list');
-  if (data.surahs.length === 0) {
-    listEl.classList.add('hidden');
-    return;
-  }
-
-  listEl.classList.remove('hidden');
-  document.getElementById('upload-status').classList.remove('hidden');
-  document.getElementById('upload-count').textContent =
-    `${data.surahs.length} files uploaded`;
-
-  listEl.innerHTML = data.surahs.map(s => `
-    <div class="file-item">
-      <span>${s.surah}. ${s.name} (${s.size_mb} MB)</span>
-      <span class="${s.analyzed ? 'analyzed' : 'pending'}">
-        ${s.analyzed ? 'Analyzed' : 'Pending'}
-      </span>
-    </div>
-  `).join('');
+  uploadedFiles = data.surahs.map(s => ({ surah: s.surah, name: s.name, size_mb: s.size_mb, status: s.analyzed ? 'analyzed' : 'uploaded' }));
+  renderUploadedList();
 }
 
-// ── Analysis ────────────────────────────────────────────────────────
-async function analyzeAll() {
-  const btn = document.getElementById('btn-analyze-all');
-  btn.disabled = true;
-  btn.textContent = 'Analyzing...';
-
-  const progressEl = document.getElementById('analysis-progress');
-  progressEl.classList.remove('hidden');
-
-  try {
-    const res = await fetch(`${API}/api/analyze-all`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    const data = await res.json();
-
-    document.getElementById('analysis-fill').style.width = '100%';
-    document.getElementById('analysis-status-text').textContent =
-      `Analyzed ${data.analyzed} surahs. ${data.errors.length} errors.`;
-
-    if (data.errors.length > 0) {
-      showToast(`${data.errors.length} errors during analysis`, 'error');
-    } else {
-      showToast(`All ${data.analyzed} surahs analyzed`, 'success');
-    }
-
-    listUploaded();
-  } catch (e) {
-    showToast('Analysis failed: ' + e.message, 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Analyze All Surahs';
-  }
+function renderUploadedList() {
+  const list = document.getElementById('uploaded-list');
+  const bar = document.getElementById('upload-status');
+  if (!uploadedFiles.length) { list.classList.add('hidden'); bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  document.getElementById('upload-count').textContent = `${uploadedFiles.length} file(s)`;
+  list.classList.remove('hidden');
+  list.innerHTML = uploadedFiles.map(f => {
+    const cls = f.status === 'analyzing' ? 'analyzing' : f.status === 'analyzed' ? 'analyzed' : 'pending';
+    const txt = f.status === 'analyzing' ? '<span class="spinner"></span> Analyzing...' : f.status === 'analyzed' ? 'Analyzed' : 'Ready';
+    return `<div class="file-item"><span>${f.surah}. ${f.name} (${f.size_mb} MB)</span><span class="file-status ${cls}">${txt}</span></div>`;
+  }).join('');
 }
+
+function setFileStatus(s, st) { const f = uploadedFiles.find(x => x.surah === s); if (f) { f.status = st; renderUploadedList(); } }
 
 // ── Surah Editor ────────────────────────────────────────────────────
 async function loadSurah(surahNum) {
-  if (!surahNum) {
-    document.getElementById('editor-content').classList.add('hidden');
-    document.getElementById('btn-analyze-surah').disabled = true;
-    return;
-  }
-
+  if (!surahNum) { document.getElementById('editor-content').classList.add('hidden'); return; }
   surahNum = parseInt(surahNum);
   currentSurah = surahNum;
-  currentTimings = [];
-  currentSilences = [];
-  currentAyahText = {};
+  currentTimings = []; currentSilences = []; currentAyahText = {};
+  trimStartMs = 0; trimEndMs = 0;
+  document.getElementById('trim-start').value = 0;
+  document.getElementById('trim-end').value = 0;
 
-  // Load waveform
+  // Check if we have saved timings in localStorage
+  const saved = loadAllTimingsFromLocal()[surahNum];
+
   const waveRes = await fetch(`${API}/api/waveform/${surahNum}?points=2000`);
-  if (!waveRes.ok) {
-    showToast('Audio not found. Upload the file first.', 'error');
-    return;
-  }
-  const waveData = await waveRes.json();
-  waveformData = waveData.waveform;
-  durationMs = waveData.duration_ms;
+  if (!waveRes.ok) { showToast('Audio not found. Upload first.', 'error'); return; }
+  const wd = await waveRes.json();
+  waveformData = wd.waveform; durationMs = wd.duration_ms;
 
-  // Setup audio
   audioPlayer.src = `${API}/api/audio/${surahNum}`;
 
-  // Update UI
-  const surahInfo = surahs.find(s => s.number === surahNum);
-  document.getElementById('editor-surah-name').textContent =
-    `${surahNum}. ${surahInfo.name}`;
-  document.getElementById('editor-ayah-count').textContent =
-    `${surahInfo.ayah_count} ayahs`;
-  document.getElementById('editor-duration').textContent =
-    formatTime(durationMs);
+  const info = surahs.find(s => s.number === surahNum);
+  document.getElementById('editor-surah-name').textContent = `${surahNum}. ${info.name}`;
+  document.getElementById('editor-ayah-count').textContent = `${info.ayah_count} ayahs`;
+  document.getElementById('editor-duration').textContent = formatTime(durationMs);
 
-  // Clear basmallah badge
-  const bsmBadge = document.getElementById('editor-basmallah');
-  bsmBadge.textContent = '';
-  bsmBadge.className = 'basmallah-badge';
+  const badge = document.getElementById('editor-basmallah');
+  badge.textContent = ''; badge.className = 'basmallah-badge';
 
-  // Enable analyze button
+  zoomLevel = 1; document.getElementById('zoom-level').textContent = '100%';
   document.getElementById('btn-analyze-surah').disabled = false;
-
-  // Show editor with waveform but empty table
   document.getElementById('editor-content').classList.remove('hidden');
-  document.getElementById('timing-tbody').innerHTML =
-    '<tr><td colspan="5" style="text-align:center;color:var(--text-dim);padding:2rem">Click "Analyze" to detect ayah boundaries</td></tr>';
-  markersOverlay.innerHTML = '';
 
-  renderWaveform();
+  // Show saved indicator
+  const si = document.getElementById('saved-indicator');
+  if (saved) {
+    si.classList.remove('hidden');
+    // Load saved timings + trim
+    currentTimings = saved.timings;
+    if (saved.trim) {
+      trimStartMs = saved.trim.start || 0;
+      trimEndMs = saved.trim.end || 0;
+      document.getElementById('trim-start').value = trimStartMs;
+      document.getElementById('trim-end').value = trimEndMs;
+    }
+    renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays();
+  } else {
+    si.classList.add('hidden');
+    markersOverlay.innerHTML = '';
+    document.getElementById('timing-tbody').innerHTML =
+      '<tr><td colspan="5" style="text-align:center;color:var(--text-dim);padding:1.5rem">Click "Analyze" to detect ayah boundaries</td></tr>';
+    renderWaveform(); updateTrimOverlays();
+  }
 }
 
 async function analyzeCurrent() {
   if (!currentSurah) return;
-
   const btn = document.getElementById('btn-analyze-surah');
-  btn.disabled = true;
-  btn.textContent = 'Analyzing...';
+  btn.disabled = true; btn.textContent = 'Analyzing...';
+  setFileStatus(currentSurah, 'analyzing');
 
   try {
-    const analyzeRes = await fetch(`${API}/api/analyze/${currentSurah}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+    const res = await fetch(`${API}/api/analyze/${currentSurah}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trim_start_ms: trimStartMs, trim_end_ms: trimEndMs }),
     });
+    if (!res.ok) { showToast('Analysis failed', 'error'); setFileStatus(currentSurah, 'uploaded'); return; }
 
-    if (!analyzeRes.ok) {
-      showToast('Analysis failed', 'error');
-      return;
+    const d = await res.json();
+    currentTimings = d.timings; currentSilences = d.silences || []; currentAyahText = d.ayah_text || {};
+
+    if (d.basmallah_detected != null) {
+      showToast(d.basmallah_detected ? 'Basmallah detected' : 'No Basmallah detected', d.basmallah_detected ? 'success' : 'info');
     }
 
-    const analyzeData = await analyzeRes.json();
-    currentTimings = analyzeData.timings;
-    currentSilences = analyzeData.silences || [];
-    currentAyahText = analyzeData.ayah_text || {};
-
-    // Show basmallah detection result
-    if (analyzeData.basmallah_detected !== null && analyzeData.basmallah_detected !== undefined) {
-      const bsmStatus = analyzeData.basmallah_detected
-        ? 'Basmallah detected'
-        : 'No Basmallah detected (reciter starts with ayah 1)';
-      showToast(bsmStatus, analyzeData.basmallah_detected ? 'success' : 'info');
+    if (!Object.keys(currentAyahText).length) {
+      const tr = await fetch(`${API}/api/text/${currentSurah}`);
+      if (tr.ok) { const td = await tr.json(); if (td.available) currentAyahText = td.ayahs; }
     }
 
-    // Fetch ayah text if not included
-    if (Object.keys(currentAyahText).length === 0) {
-      const textRes = await fetch(`${API}/api/text/${currentSurah}`);
-      if (textRes.ok) {
-        const textData = await textRes.json();
-        if (textData.available) {
-          currentAyahText = textData.ayahs;
-        }
-      }
-    }
+    const badge = document.getElementById('editor-basmallah');
+    if (d.basmallah_detected === true) { badge.textContent = 'Basmallah detected'; badge.className = 'basmallah-badge detected'; }
+    else if (d.basmallah_detected === false) { badge.textContent = 'No Basmallah'; badge.className = 'basmallah-badge not-detected'; }
 
-    // Show basmallah badge
-    const bsmBadge = document.getElementById('editor-basmallah');
-    if (analyzeData.basmallah_detected === true) {
-      bsmBadge.textContent = 'Basmallah detected';
-      bsmBadge.className = 'basmallah-badge detected';
-    } else if (analyzeData.basmallah_detected === false) {
-      bsmBadge.textContent = 'No Basmallah';
-      bsmBadge.className = 'basmallah-badge not-detected';
-    } else {
-      bsmBadge.textContent = '';
-      bsmBadge.className = 'basmallah-badge';
-    }
-
-    renderWaveform();
-    renderMarkers();
-    renderTimingTable();
-  } catch (e) {
-    showToast('Analysis failed: ' + e.message, 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Analyze';
-  }
+    setFileStatus(currentSurah, 'analyzed');
+    renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays();
+  } catch (e) { showToast('Error: ' + e.message, 'error'); setFileStatus(currentSurah, 'uploaded'); }
+  finally { btn.disabled = false; btn.textContent = 'Analyze'; }
 }
 
-async function reanalyze() {
-  await analyzeCurrent();
+// ── Save to localStorage ────────────────────────────────────────────
+function saveToLocal() {
+  if (!currentSurah || !currentTimings.length) { showToast('Nothing to save', 'error'); return; }
+  saveTimingsToLocal(currentSurah, currentTimings, { start: trimStartMs, end: trimEndMs });
+  document.getElementById('saved-indicator').classList.remove('hidden');
+  updateSavedSummary();
+  showToast(`Surah ${currentSurah} saved`, 'success');
 }
 
-// ── Waveform Rendering ──────────────────────────────────────────────
+function updateSavedSummary() {
+  const saved = getSavedSurahs();
+  const el = document.getElementById('saved-surahs-summary');
+  if (!saved.length) { el.innerHTML = '<span style="color:var(--text-dim)">No surahs saved yet. Analyze and save surahs above.</span>'; return; }
+  el.innerHTML = `<strong>${saved.length}</strong> surah(s) ready to export: ` +
+    saved.map(n => `<span class="surah-chip">${n}. ${surahs.find(s=>s.number===n)?.name||n}</span>`).join('');
+}
+
+function clearAllLocal() {
+  if (!confirm('Clear all saved timings and cached audio?')) return;
+  clearAllTimingsLocal();
+  clearAllAudioBlobs();
+  updateSavedSummary();
+  document.getElementById('saved-indicator').classList.add('hidden');
+  showToast('All data cleared', 'info');
+}
+
+// ── Trim ────────────────────────────────────────────────────────────
+function onTrimChange() {
+  trimStartMs = parseInt(document.getElementById('trim-start').value) || 0;
+  trimEndMs = parseInt(document.getElementById('trim-end').value) || 0;
+  updateTrimOverlays();
+}
+
+function updateTrimOverlays() {
+  if (!durationMs) return;
+  const sl = document.getElementById('trim-start-overlay');
+  const sr = document.getElementById('trim-end-overlay');
+  sl.style.width = `${(trimStartMs / durationMs) * 100}%`;
+  sr.style.width = `${(trimEndMs / durationMs) * 100}%`;
+}
+
+// ── Zoom ────────────────────────────────────────────────────────────
+function zoomIn() { setZoom(Math.min(zoomLevel * 1.5, 30)); }
+function zoomOut() { setZoom(Math.max(zoomLevel / 1.5, 1)); }
+function zoomReset() { setZoom(1); }
+function setZoom(l) { zoomLevel = l; document.getElementById('zoom-level').textContent = `${Math.round(l*100)}%`; renderWaveform(); renderMarkers(); updateTrimOverlays(); scrollToPlayhead(); }
+function scrollToPlayhead() {
+  const sc = document.getElementById('waveform-scroll');
+  const ct = document.getElementById('waveform-container');
+  if (!sc || !ct) return;
+  const px = (audioPlayer.currentTime * 1000 / durationMs) * ct.offsetWidth;
+  sc.scrollLeft = px - sc.clientWidth / 2;
+}
+
+// ── Waveform ────────────────────────────────────────────────────────
 function renderWaveform() {
-  const container = document.getElementById('waveform-container');
-  const rect = container.getBoundingClientRect();
+  const sc = document.getElementById('waveform-scroll');
+  const ct = document.getElementById('waveform-container');
+  const vw = sc.clientWidth;
+  const tw = vw * zoomLevel;
+  ct.style.width = `${tw}px`;
   const dpr = window.devicePixelRatio || 1;
-
-  waveformCanvas.width = rect.width * dpr;
-  waveformCanvas.height = rect.height * dpr;
-  ctx.scale(dpr, dpr);
-
-  const w = rect.width;
-  const h = rect.height;
-  const mid = h / 2;
-  const barWidth = w / waveformData.length;
-
-  // Background
-  ctx.fillStyle = '#0f1117';
-  ctx.fillRect(0, 0, w, h);
-
-  // Draw silence regions
-  ctx.fillStyle = 'rgba(56, 217, 169, 0.08)';
-  for (const [start, end] of currentSilences) {
-    const x1 = (start / durationMs) * w;
-    const x2 = (end / durationMs) * w;
-    ctx.fillRect(x1, 0, x2 - x1, h);
-  }
-
-  // Draw waveform bars
+  const h = 170;
+  waveformCanvas.width = tw * dpr; waveformCanvas.height = h * dpr;
+  waveformCanvas.style.width = `${tw}px`; waveformCanvas.style.height = `${h}px`;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const mid = h / 2, bw = tw / waveformData.length;
+  ctx.fillStyle = '#0f1117'; ctx.fillRect(0, 0, tw, h);
+  ctx.fillStyle = 'rgba(56,217,169,0.08)';
+  for (const [s, e] of currentSilences) { ctx.fillRect((s/durationMs)*tw, 0, ((e-s)/durationMs)*tw, h); }
   ctx.fillStyle = '#4f8cff';
-  for (let i = 0; i < waveformData.length; i++) {
-    const amp = waveformData[i];
-    const barH = amp * (h * 0.8);
-    const x = i * barWidth;
-    ctx.fillRect(x, mid - barH / 2, Math.max(barWidth - 0.5, 0.5), barH);
-  }
-
-  // Center line
-  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(0, mid);
-  ctx.lineTo(w, mid);
-  ctx.stroke();
+  for (let i = 0; i < waveformData.length; i++) { const bh = waveformData[i]*(h*0.8); ctx.fillRect(i*bw, mid-bh/2, Math.max(bw-0.5,0.5), bh); }
 }
 
-// ── Markers (draggable ayah boundaries) ─────────────────────────────
+// ── Markers ─────────────────────────────────────────────────────────
 function renderMarkers() {
   markersOverlay.innerHTML = '';
-
   for (let i = 0; i < currentTimings.length; i++) {
-    const t = currentTimings[i];
-    if (t.ayah === 999) continue;
-
-    const pct = (t.time / durationMs) * 100;
-    const marker = document.createElement('div');
-    marker.className = 'marker';
-    marker.style.left = `${pct}%`;
-    marker.dataset.index = i;
-
-    const label = document.createElement('div');
-    label.className = 'marker-label';
-    label.textContent = t.ayah === 0 ? 'Bsm' : `${t.ayah}`;
-    marker.appendChild(label);
-
-    marker.addEventListener('mousedown', startDrag);
-    marker.addEventListener('touchstart', startDragTouch, { passive: false });
-
-    markersOverlay.appendChild(marker);
+    const t = currentTimings[i]; if (t.ayah === 999) continue;
+    const mk = document.createElement('div'); mk.className = 'marker';
+    mk.style.left = `${(t.time/durationMs)*100}%`; mk.dataset.index = i;
+    const lb = document.createElement('div'); lb.className = 'marker-label';
+    lb.textContent = t.ayah === 0 ? 'Bsm' : `${t.ayah}`; mk.appendChild(lb);
+    mk.addEventListener('mousedown', startDrag);
+    mk.addEventListener('touchstart', startDragTouch, { passive: false });
+    markersOverlay.appendChild(mk);
   }
 }
-
-function startDrag(e) {
-  e.preventDefault();
-  dragMarker = e.currentTarget;
-  dragMarker.classList.add('dragging');
-  document.addEventListener('mousemove', onDrag);
-  document.addEventListener('mouseup', endDrag);
-}
-
-function startDragTouch(e) {
-  e.preventDefault();
-  dragMarker = e.currentTarget;
-  dragMarker.classList.add('dragging');
-  document.addEventListener('touchmove', onDragTouch, { passive: false });
-  document.addEventListener('touchend', endDragTouch);
-}
-
-function onDrag(e) {
-  if (!dragMarker) return;
-  updateMarkerPosition(e.clientX);
-}
-
-function onDragTouch(e) {
-  if (!dragMarker) return;
-  e.preventDefault();
-  updateMarkerPosition(e.touches[0].clientX);
-}
-
-function updateMarkerPosition(clientX) {
-  const container = document.getElementById('waveform-container');
-  const rect = container.getBoundingClientRect();
-  let pct = ((clientX - rect.left) / rect.width) * 100;
-  pct = Math.max(0, Math.min(100, pct));
-
+function startDrag(e) { e.preventDefault(); dragMarker = e.currentTarget; dragMarker.classList.add('dragging'); document.addEventListener('mousemove', onDrag); document.addEventListener('mouseup', endDrag); }
+function startDragTouch(e) { e.preventDefault(); dragMarker = e.currentTarget; dragMarker.classList.add('dragging'); document.addEventListener('touchmove', onDragTouch, {passive:false}); document.addEventListener('touchend', endDragTouch); }
+function onDrag(e) { if (dragMarker) updateMarkerPos(e.clientX); }
+function onDragTouch(e) { if (dragMarker) { e.preventDefault(); updateMarkerPos(e.touches[0].clientX); } }
+function updateMarkerPos(cx) {
+  const ct = document.getElementById('waveform-container');
+  const r = ct.getBoundingClientRect();
+  let pct = Math.max(0, Math.min(100, ((cx - r.left) / ct.offsetWidth) * 100));
   dragMarker.style.left = `${pct}%`;
-
   const idx = parseInt(dragMarker.dataset.index);
-  const newTime = Math.round((pct / 100) * durationMs);
-  currentTimings[idx].time = newTime;
-
-  updateTimingRow(idx, newTime);
+  currentTimings[idx].time = Math.round((pct/100)*durationMs);
+  updateTimingRow(idx, currentTimings[idx].time);
 }
+function endDrag() { if (dragMarker) dragMarker.classList.remove('dragging'); dragMarker = null; document.removeEventListener('mousemove', onDrag); document.removeEventListener('mouseup', endDrag); }
+function endDragTouch() { if (dragMarker) dragMarker.classList.remove('dragging'); dragMarker = null; document.removeEventListener('touchmove', onDragTouch); document.removeEventListener('touchend', endDragTouch); }
 
-function endDrag() {
-  if (dragMarker) dragMarker.classList.remove('dragging');
-  dragMarker = null;
-  document.removeEventListener('mousemove', onDrag);
-  document.removeEventListener('mouseup', endDrag);
-}
-
-function endDragTouch() {
-  if (dragMarker) dragMarker.classList.remove('dragging');
-  dragMarker = null;
-  document.removeEventListener('touchmove', onDragTouch);
-  document.removeEventListener('touchend', endDragTouch);
-}
-
-// ── Waveform Click (seek audio) ─────────────────────────────────────
+// ── Waveform Click + Wheel ──────────────────────────────────────────
 function setupWaveformInteraction() {
-  const container = document.getElementById('waveform-container');
-
-  container.addEventListener('click', (e) => {
-    if (dragMarker) return;
-    const rect = container.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    const seekTime = pct * (durationMs / 1000);
-    audioPlayer.currentTime = seekTime;
-  });
-
-  window.addEventListener('resize', () => {
-    if (waveformData.length > 0) {
-      renderWaveform();
-      renderMarkers();
-    }
-  });
+  const ct = document.getElementById('waveform-container');
+  const sc = document.getElementById('waveform-scroll');
+  ct.addEventListener('click', e => { if (dragMarker) return; audioPlayer.currentTime = ((e.clientX - ct.getBoundingClientRect().left) / ct.offsetWidth) * (durationMs/1000); });
+  sc.addEventListener('wheel', e => { if (e.ctrlKey || e.metaKey) { e.preventDefault(); setZoom(Math.max(1, Math.min(30, zoomLevel * (e.deltaY > 0 ? 0.8 : 1.25)))); } }, { passive: false });
+  window.addEventListener('resize', () => { if (waveformData.length) { renderWaveform(); renderMarkers(); updateTrimOverlays(); } });
 }
 
-// ── Audio Player ────────────────────────────────────────────────────
+// ── Audio ───────────────────────────────────────────────────────────
 function setupAudioEvents() {
-  audioPlayer.addEventListener('timeupdate', () => {
-    updatePlayhead();
-    updateTimeDisplay();
-    highlightActiveRow();
-  });
-
-  audioPlayer.addEventListener('play', () => {
-    playhead.style.display = 'block';
-    document.getElementById('btn-play').textContent = 'Pause';
-  });
-
-  audioPlayer.addEventListener('pause', () => {
-    document.getElementById('btn-play').textContent = 'Play';
-  });
-
-  audioPlayer.addEventListener('ended', () => {
-    playhead.style.display = 'none';
-    document.getElementById('btn-play').textContent = 'Play';
-  });
+  audioPlayer.addEventListener('timeupdate', () => { updatePlayhead(); updateTimeDisplay(); highlightActiveRow(); });
+  audioPlayer.addEventListener('play', () => { playhead.style.display = 'block'; document.getElementById('btn-play').textContent = 'Pause'; });
+  audioPlayer.addEventListener('pause', () => { document.getElementById('btn-play').textContent = 'Play'; });
+  audioPlayer.addEventListener('ended', () => { playhead.style.display = 'none'; document.getElementById('btn-play').textContent = 'Play'; });
 }
+function togglePlay() { audioPlayer.paused ? audioPlayer.play() : audioPlayer.pause(); }
+function stopAudio() { audioPlayer.pause(); audioPlayer.currentTime = 0; playhead.style.display = 'none'; document.getElementById('btn-play').textContent = 'Play'; document.getElementById('current-ayah-label').textContent = ''; }
+function setPlaybackSpeed(v) { audioPlayer.playbackRate = parseFloat(v); }
 
-function togglePlay() {
-  if (audioPlayer.paused) {
-    audioPlayer.play();
-  } else {
-    audioPlayer.pause();
+function prevAyah() {
+  if (!currentTimings.length) return;
+  const ms = audioPlayer.currentTime * 1000;
+  for (let i = currentTimings.length - 1; i >= 0; i--) {
+    if (currentTimings[i].ayah !== 999 && currentTimings[i].time < ms - 500) {
+      audioPlayer.currentTime = currentTimings[i].time / 1000; scrollToPlayhead(); return;
+    }
   }
-}
-
-function stopAudio() {
-  audioPlayer.pause();
   audioPlayer.currentTime = 0;
-  playhead.style.display = 'none';
-  document.getElementById('btn-play').textContent = 'Play';
 }
-
-function setPlaybackSpeed(speed) {
-  audioPlayer.playbackRate = parseFloat(speed);
+function nextAyah() {
+  if (!currentTimings.length) return;
+  const ms = audioPlayer.currentTime * 1000;
+  for (let i = 0; i < currentTimings.length; i++) {
+    if (currentTimings[i].ayah !== 999 && currentTimings[i].time > ms + 200) {
+      audioPlayer.currentTime = currentTimings[i].time / 1000; scrollToPlayhead(); return;
+    }
+  }
 }
 
 function updatePlayhead() {
-  const currentMs = audioPlayer.currentTime * 1000;
-  const pct = (currentMs / durationMs) * 100;
+  const pct = (audioPlayer.currentTime * 1000 / durationMs) * 100;
   playhead.style.left = `${pct}%`;
-}
-
-function updateTimeDisplay() {
-  const current = formatTime(audioPlayer.currentTime * 1000);
-  const total = formatTime(durationMs);
-  document.getElementById('audio-time').textContent = `${current} / ${total}`;
-}
-
-function highlightActiveRow() {
-  const currentMs = audioPlayer.currentTime * 1000;
-  const rows = document.querySelectorAll('#timing-tbody tr');
-  let activeIdx = 0;
-
-  for (let i = currentTimings.length - 1; i >= 0; i--) {
-    if (currentTimings[i].ayah !== 999 && currentMs >= currentTimings[i].time) {
-      activeIdx = i;
-      break;
-    }
+  if (!audioPlayer.paused && zoomLevel > 1) {
+    const sc = document.getElementById('waveform-scroll');
+    const ct = document.getElementById('waveform-container');
+    const px = (pct/100) * ct.offsetWidth;
+    if (px < sc.scrollLeft + 40 || px > sc.scrollLeft + sc.clientWidth - 40) sc.scrollLeft = px - sc.clientWidth / 2;
   }
-
-  rows.forEach((row, i) => {
-    row.classList.toggle('active-row', i === activeIdx);
-  });
+}
+function updateTimeDisplay() { document.getElementById('audio-time').textContent = `${formatTime(audioPlayer.currentTime*1000)} / ${formatTime(durationMs)}`; }
+function highlightActiveRow() {
+  const ms = audioPlayer.currentTime * 1000;
+  const rows = document.querySelectorAll('#timing-tbody tr');
+  let ai = 0;
+  for (let i = currentTimings.length-1; i >= 0; i--) { if (currentTimings[i].ayah !== 999 && ms >= currentTimings[i].time) { ai = i; break; } }
+  rows.forEach((r, i) => r.classList.toggle('active-row', i === ai));
+  const a = currentTimings[ai]?.ayah;
+  document.getElementById('current-ayah-label').textContent = a != null && a !== 999 ? (a === 0 ? 'Basmallah' : `Ayah ${a}`) : '';
 }
 
 // ── Timing Table ────────────────────────────────────────────────────
 function renderTimingTable() {
-  const tbody = document.getElementById('timing-tbody');
-  tbody.innerHTML = '';
-
+  const tb = document.getElementById('timing-tbody'); tb.innerHTML = '';
   currentTimings.forEach((t, idx) => {
     const tr = document.createElement('tr');
     if (t.ayah === 0 || t.ayah === 999) tr.className = 'special-row';
-
-    const ayahLabel = t.ayah === 0 ? 'Basmallah' : t.ayah === 999 ? 'End' : t.ayah;
-
-    // Get Arabic text for this ayah
-    const ayahText = currentAyahText[String(t.ayah)] || '';
-    const textHtml = ayahText
-      ? `<span class="ayah-text">${escapeHtml(ayahText)}</span>`
-      : '<span style="color:var(--text-dim);font-size:0.8rem">-</span>';
-
-    tr.innerHTML = `
-      <td>${ayahLabel}</td>
-      <td>${textHtml}</td>
-      <td>
-        <input type="number" value="${t.time}" min="0" max="${durationMs}"
-               data-index="${idx}" onchange="onTimingInput(this)">
-      </td>
-      <td>${formatTime(t.time)}</td>
-      <td>
-        <button class="btn btn-sm" onclick="seekTo(${t.time})">Seek</button>
-        <button class="btn btn-sm" onclick="playFromAyah(${idx})">Play</button>
-      </td>
-    `;
-
-    tr.addEventListener('click', (e) => {
-      if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
-      seekTo(t.time);
-    });
-
-    tbody.appendChild(tr);
+    const lbl = t.ayah === 0 ? 'Basmallah' : t.ayah === 999 ? 'End' : t.ayah;
+    const txt = currentAyahText[String(t.ayah)] || '';
+    const th = txt ? `<span class="ayah-text">${esc(txt)}</span>` : '<span style="color:var(--text-dim)">-</span>';
+    tr.innerHTML = `<td>${lbl}</td><td>${th}</td><td><input type="number" value="${t.time}" min="0" max="${durationMs}" data-index="${idx}" onchange="onTimingInput(this)"></td><td>${formatTime(t.time)}</td><td><button class="btn btn-sm" onclick="seekTo(${t.time})">Seek</button> <button class="btn btn-sm" onclick="playFrom(${idx})">Play</button></td>`;
+    tr.addEventListener('click', e => { if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'INPUT') seekTo(t.time); });
+    tb.appendChild(tr);
   });
 }
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-function onTimingInput(input) {
-  const idx = parseInt(input.dataset.index);
-  const newTime = parseInt(input.value);
-  currentTimings[idx].time = newTime;
-
-  // Update formatted time in next sibling cell
-  const cells = input.closest('tr').querySelectorAll('td');
-  cells[3].textContent = formatTime(newTime);
-
+function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+function onTimingInput(inp) {
+  const i = parseInt(inp.dataset.index); currentTimings[i].time = parseInt(inp.value);
+  inp.closest('tr').querySelectorAll('td')[3].textContent = formatTime(currentTimings[i].time);
   renderMarkers();
 }
-
-function updateTimingRow(idx, newTime) {
-  const input = document.querySelector(`#timing-tbody input[data-index="${idx}"]`);
-  if (input) {
-    input.value = newTime;
-    const cells = input.closest('tr').querySelectorAll('td');
-    cells[3].textContent = formatTime(newTime);
-  }
+function updateTimingRow(i, v) {
+  const inp = document.querySelector(`#timing-tbody input[data-index="${i}"]`);
+  if (inp) { inp.value = v; inp.closest('tr').querySelectorAll('td')[3].textContent = formatTime(v); }
 }
-
-function seekTo(timeMs) {
-  audioPlayer.currentTime = timeMs / 1000;
-  if (audioPlayer.paused) {
-    updatePlayhead();
-    playhead.style.display = 'block';
-  }
-}
-
-function playFromAyah(idx) {
-  audioPlayer.currentTime = currentTimings[idx].time / 1000;
-  audioPlayer.play();
-}
-
-// ── Save Timings ────────────────────────────────────────────────────
-async function saveTiming() {
-  if (!currentSurah) return;
-
-  const res = await fetch(`${API}/api/timings/${currentSurah}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ timings: currentTimings }),
-  });
-
-  if (res.ok) {
-    showToast('Timings saved', 'success');
-  } else {
-    showToast('Failed to save timings', 'error');
-  }
-}
+function seekTo(ms) { audioPlayer.currentTime = ms/1000; if (audioPlayer.paused) { updatePlayhead(); playhead.style.display = 'block'; } }
+function playFrom(i) { audioPlayer.currentTime = currentTimings[i].time/1000; audioPlayer.play(); }
 
 // ── Export ───────────────────────────────────────────────────────────
 async function exportDb() {
-  const dbName = document.getElementById('db-name').value || 'gapless_timing';
-  const statusEl = document.getElementById('export-status');
+  const all = loadAllTimingsFromLocal();
+  const allTimings = {};
+  for (const [k, v] of Object.entries(all)) allTimings[k] = v.timings;
 
+  if (!Object.keys(allTimings).length) { showToast('No saved surahs to export', 'error'); return; }
+
+  const dbName = document.getElementById('db-name').value || 'gapless_timing';
   try {
     const res = await fetch(`${API}/api/export`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ db_name: dbName }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ db_name: dbName, all_timings: allTimings }),
     });
-
-    const data = await res.json();
-
-    if (data.success) {
-      statusEl.className = 'success';
-      statusEl.textContent = `Exported ${data.surahs_exported} surahs to ${dbName}.db.zip`;
-      statusEl.classList.remove('hidden');
-      document.getElementById('btn-download').disabled = false;
+    const d = await res.json();
+    const st = document.getElementById('export-status');
+    if (d.success) {
+      st.className = 'success'; st.textContent = `Exported ${d.surahs_exported} surahs to ${dbName}.db.zip`;
+      st.classList.remove('hidden'); document.getElementById('btn-download').disabled = false;
       showToast('Export complete', 'success');
-    } else {
-      statusEl.className = 'error';
-      statusEl.textContent = data.error;
-      statusEl.classList.remove('hidden');
-    }
-  } catch (e) {
-    showToast('Export failed: ' + e.message, 'error');
-  }
+    } else { st.className = 'error'; st.textContent = d.error; st.classList.remove('hidden'); }
+  } catch (e) { showToast('Export failed: ' + e.message, 'error'); }
 }
-
-function downloadExport() {
-  const dbName = document.getElementById('db-name').value || 'gapless_timing';
-  window.open(`${API}/api/export/download?db_name=${dbName}`, '_blank');
-}
+function downloadExport() { window.open(`${API}/api/export/download?db_name=${document.getElementById('db-name').value || 'gapless_timing'}`, '_blank'); }
 
 // ── Utilities ───────────────────────────────────────────────────────
-function formatTime(ms) {
-  const totalSec = ms / 1000;
-  const min = Math.floor(totalSec / 60);
-  const sec = Math.floor(totalSec % 60);
-  const msRem = Math.floor(ms % 1000);
-  return `${min}:${sec.toString().padStart(2, '0')}.${msRem.toString().padStart(3, '0')}`;
-}
-
-function showToast(msg, type = 'info') {
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.textContent = msg;
-  document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 3500);
-}
+function formatTime(ms) { const m = Math.floor(ms/60000), s = Math.floor((ms%60000)/1000), r = Math.floor(ms%1000); return `${m}:${s.toString().padStart(2,'0')}.${r.toString().padStart(3,'0')}`; }
+function showToast(msg, type='info') { const t = document.createElement('div'); t.className = `toast ${type}`; t.textContent = msg; document.body.appendChild(t); setTimeout(()=>t.remove(), 3500); }

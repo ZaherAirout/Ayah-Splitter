@@ -13,66 +13,47 @@
   </header>
 
   <main>
-    <!-- Step 1: Upload -->
+    <!-- Step 1: Upload & Select -->
     <section id="upload-section" class="card">
-      <h2>1. Upload Audio Files</h2>
-      <p>Upload MP3 files numbered 1-114 (one per surah) or select individual files.</p>
+      <h2>1. Upload & Select Surah</h2>
 
-      <div class="upload-area" id="drop-zone">
-        <div class="upload-icon">&#128190;</div>
-        <p>Drag & drop MP3 files here, or click to browse</p>
-        <input type="file" id="file-input" multiple accept=".mp3" hidden>
-        <button class="btn" onclick="document.getElementById('file-input').click()">Select Files</button>
-      </div>
-
-      <div id="upload-status" class="status-bar hidden">
-        <span id="upload-count">0 files uploaded</span>
-        <button class="btn btn-sm" id="btn-list-uploaded" onclick="listUploaded()">Refresh List</button>
-      </div>
-
-      <div id="uploaded-list" class="file-list hidden"></div>
-    </section>
-
-    <!-- Step 2: Analyze -->
-    <section id="analyze-section" class="card">
-      <h2>2. Analyze</h2>
-      <div class="actions">
-        <button class="btn btn-primary" id="btn-analyze-all" onclick="analyzeAll()">Analyze All Surahs</button>
+      <div class="single-upload">
+        <select id="upload-surah-select">
+          <option value="">-- Select surah --</option>
+        </select>
+        <input type="file" id="single-file-input" accept=".mp3" hidden>
+        <button class="btn btn-primary" onclick="document.getElementById('single-file-input').click()">Upload File</button>
         <button class="btn btn-sm" id="btn-preferences" onclick="togglePreferences()">Preferences</button>
       </div>
 
-      <!-- Collapsible preferences -->
-      <div id="preferences-panel" class="preferences-panel hidden">
-        <div class="settings-grid">
-          <div class="setting">
-            <label for="min-silence-len">Min Silence Length (ms)</label>
-            <input type="number" id="min-silence-len" value="120" min="50" max="2000" step="10">
-            <small>Minimum duration to detect as silence</small>
-          </div>
-          <div class="setting">
-            <label for="silence-thresh">Silence Threshold (dB relative)</label>
-            <input type="number" id="silence-thresh" value="-10" min="-20" max="-4" step="1">
-            <small>Relative to audio loudness (auto-tuned by default)</small>
-          </div>
-        </div>
+      <div class="upload-area" id="drop-zone">
+        <p>Or drag & drop multiple MP3 files (named 1.mp3 - 114.mp3)</p>
+        <input type="file" id="file-input" multiple accept=".mp3" hidden>
+        <button class="btn" onclick="document.getElementById('file-input').click()">Select Multiple</button>
       </div>
 
-      <div id="analysis-progress" class="hidden">
-        <div class="progress-bar"><div class="progress-fill" id="analysis-fill"></div></div>
-        <span id="analysis-status-text"></span>
+      <div id="preferences-panel" class="preferences-panel hidden">
+        <small>These are auto-tuned. Only change if results are poor.</small>
       </div>
+
+      <div id="upload-status" class="status-bar hidden">
+        <span id="upload-count">0 file(s)</span>
+        <button class="btn btn-sm" onclick="refreshUploadedList()">Refresh</button>
+      </div>
+      <div id="uploaded-list" class="file-list hidden"></div>
     </section>
 
-    <!-- Step 3: Review & Edit -->
+    <!-- Step 2: Editor -->
     <section id="editor-section" class="card">
-      <h2>3. Review & Edit Timings</h2>
+      <h2>2. Analyze & Edit</h2>
 
       <div class="surah-selector">
-        <label for="surah-select">Select Surah:</label>
+        <label for="surah-select">Surah:</label>
         <select id="surah-select" onchange="loadSurah(this.value)">
-          <option value="">-- Select a surah --</option>
+          <option value="">-- Select --</option>
         </select>
         <button class="btn btn-primary" id="btn-analyze-surah" onclick="analyzeCurrent()" disabled>Analyze</button>
+        <span id="saved-indicator" class="saved-indicator hidden">Saved</span>
       </div>
 
       <div id="editor-content" class="hidden">
@@ -83,19 +64,48 @@
           <span id="editor-basmallah" class="basmallah-badge"></span>
         </div>
 
-        <!-- Waveform + Markers -->
-        <div id="waveform-container">
-          <canvas id="waveform-canvas"></canvas>
-          <div id="markers-overlay"></div>
-          <div id="playhead" class="playhead"></div>
+        <!-- Trim Controls -->
+        <div class="trim-controls">
+          <label>Trim start:
+            <input type="number" id="trim-start" value="0" min="0" step="100" onchange="onTrimChange()"> ms
+          </label>
+          <label>Trim end:
+            <input type="number" id="trim-end" value="0" min="0" step="100" onchange="onTrimChange()"> ms
+          </label>
+          <div class="trim-visual">
+            <div id="trim-start-region" class="trim-region trim-left"></div>
+            <div id="trim-end-region" class="trim-region trim-right"></div>
+          </div>
         </div>
 
-        <!-- Audio Player -->
+        <!-- Zoom -->
+        <div class="zoom-controls">
+          <button class="btn btn-sm" onclick="zoomIn()">+ Zoom In</button>
+          <button class="btn btn-sm" onclick="zoomOut()">- Zoom Out</button>
+          <button class="btn btn-sm" onclick="zoomReset()">Fit</button>
+          <span id="zoom-level" class="zoom-label">100%</span>
+        </div>
+
+        <!-- Waveform -->
+        <div id="waveform-scroll" class="waveform-scroll">
+          <div id="waveform-container">
+            <canvas id="waveform-canvas"></canvas>
+            <div id="markers-overlay"></div>
+            <div id="playhead" class="playhead"></div>
+            <div id="trim-start-overlay" class="trim-overlay-left"></div>
+            <div id="trim-end-overlay" class="trim-overlay-right"></div>
+          </div>
+        </div>
+
+        <!-- Audio Controls -->
         <div class="audio-controls">
           <audio id="audio-player" preload="auto"></audio>
-          <button class="btn btn-sm" onclick="togglePlay()" id="btn-play">Play</button>
+          <button class="btn btn-sm" onclick="prevAyah()">Prev</button>
+          <button class="btn btn-sm btn-play" onclick="togglePlay()" id="btn-play">Play</button>
+          <button class="btn btn-sm" onclick="nextAyah()">Next</button>
           <button class="btn btn-sm" onclick="stopAudio()">Stop</button>
           <span id="audio-time">0:00 / 0:00</span>
+          <span id="current-ayah-label" class="current-ayah-label"></span>
           <label class="playback-speed">
             Speed:
             <select id="playback-speed" onchange="setPlaybackSpeed(this.value)">
@@ -104,6 +114,7 @@
               <option value="1" selected>1x</option>
               <option value="1.25">1.25x</option>
               <option value="1.5">1.5x</option>
+              <option value="2">2x</option>
             </select>
           </label>
         </div>
@@ -125,24 +136,26 @@
         </div>
 
         <div class="actions">
-          <button class="btn" onclick="saveTiming()">Save Changes</button>
-          <button class="btn" onclick="reanalyze()">Re-analyze</button>
+          <button class="btn btn-primary" onclick="saveToLocal()">Save Surah</button>
+          <button class="btn" onclick="analyzeCurrent()">Re-analyze</button>
         </div>
       </div>
     </section>
 
-    <!-- Step 4: Export -->
+    <!-- Step 3: Export -->
     <section id="export-section" class="card">
-      <h2>4. Export Database</h2>
+      <h2>3. Export Database</h2>
+      <div id="saved-surahs-summary"></div>
       <div class="settings-grid">
         <div class="setting">
           <label for="db-name">Database Name</label>
-          <input type="text" id="db-name" value="gapless_timing" placeholder="e.g., gapless_timing">
+          <input type="text" id="db-name" value="gapless_timing">
         </div>
       </div>
       <div class="actions">
         <button class="btn btn-primary" onclick="exportDb()">Export .db.zip</button>
         <button class="btn" id="btn-download" onclick="downloadExport()" disabled>Download</button>
+        <button class="btn btn-danger-outline" onclick="clearAllLocal()">Clear All Saved</button>
       </div>
       <div id="export-status" class="hidden"></div>
     </section>

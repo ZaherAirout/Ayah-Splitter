@@ -2,12 +2,10 @@
 
 import os
 import json
-import tempfile
 import traceback
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 
 from audio_analyzer import analyze_surah, get_waveform_data, load_audio
 from db_export import create_timing_database, export_as_zip
@@ -23,9 +21,9 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/data/output")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# In-memory store of current session timings
-# Key: surah_number, Value: list of timing dicts
+# Session state
 session_timings: dict[int, list[dict]] = {}
+session_uploads: set[int] = set()  # Track which surahs were uploaded this session
 
 
 @app.route("/")
@@ -57,7 +55,6 @@ def upload_file():
     surah_number = request.form.get("surah_number")
 
     if not surah_number:
-        # Try to infer from filename (e.g., "001.mp3" or "1.mp3")
         filename = file.filename
         base = os.path.splitext(filename)[0]
         try:
@@ -70,16 +67,19 @@ def upload_file():
     if surah_number < 1 or surah_number > 114:
         return jsonify({"error": f"Invalid surah number: {surah_number}"}), 400
 
-    # Save file
     filename = f"{surah_number:03d}.mp3"
     filepath = os.path.join(UPLOAD_DIR, filename)
     file.save(filepath)
 
+    session_uploads.add(surah_number)
+
+    size_mb = os.path.getsize(filepath) / (1024 * 1024)
+
     return jsonify({
         "success": True,
         "surah_number": surah_number,
-        "filename": filename,
-        "filepath": filepath,
+        "surah_name": SURAH_NAMES[surah_number],
+        "size_mb": round(size_mb, 2),
     })
 
 
@@ -103,6 +103,7 @@ def upload_folder():
         if 1 <= surah_number <= 114:
             dest = os.path.join(UPLOAD_DIR, f"{surah_number:03d}.mp3")
             file.save(dest)
+            session_uploads.add(surah_number)
             uploaded.append(surah_number)
 
     return jsonify({"success": True, "uploaded_surahs": sorted(uploaded)})
@@ -118,13 +119,16 @@ def analyze(surah_number):
     if not os.path.exists(filepath):
         return jsonify({"error": f"Audio file not found for surah {surah_number}"}), 404
 
+    params = request.get_json(silent=True) or {}
+    trim_start = params.get("trim_start_ms", 0)
+    trim_end = params.get("trim_end_ms", 0)
+
     try:
-        result = analyze_surah(filepath, surah_number)
-
-        # Store in session
+        result = analyze_surah(
+            filepath, surah_number,
+            trim_start_ms=trim_start, trim_end_ms=trim_end,
+        )
         session_timings[surah_number] = result["timings"]
-
-        # Include ayah text if available
         text = get_surah_text(surah_number)
 
         return jsonify({
@@ -184,46 +188,23 @@ def update_timings(surah_number):
     return jsonify({"success": True, "timings": session_timings[surah_number]})
 
 
-@app.route("/api/analyze-all", methods=["POST"])
-def analyze_all():
-    """Analyze all uploaded surah files."""
-    results = []
-    errors = []
-
-    for surah_num in range(1, 115):
-        filepath = os.path.join(UPLOAD_DIR, f"{surah_num:03d}.mp3")
-        if not os.path.exists(filepath):
-            continue
-
-        try:
-            result = analyze_surah(filepath, surah_num)
-            session_timings[surah_num] = result["timings"]
-            results.append({
-                "surah": surah_num,
-                "name": SURAH_NAMES[surah_num],
-                "duration_ms": result["duration_ms"],
-                "num_ayahs": result["num_ayahs"],
-                "timing_count": len(result["timings"]),
-            })
-        except Exception as e:
-            errors.append({"surah": surah_num, "error": str(e)})
-
-    return jsonify({
-        "analyzed": len(results),
-        "results": results,
-        "errors": errors,
-    })
-
-
 @app.route("/api/export", methods=["POST"])
 def export_database():
-    """Export all timings as a quran_android compatible .db file."""
-    if not session_timings:
-        return jsonify({"error": "No timings to export. Analyze surahs first."}), 400
-
+    """Export timings as a quran_android compatible .db file.
+    Accepts timings from client (localStorage) or uses server session."""
     data = request.get_json(silent=True) or {}
     db_name = data.get("db_name", "gapless_timing")
     schema_version = data.get("schema_version", 1)
+
+    # Accept timings from client (localStorage mode)
+    client_timings = data.get("all_timings")
+    if client_timings:
+        # Format: {"1": [{ayah, time}, ...], "36": [...]}
+        for k, v in client_timings.items():
+            session_timings[int(k)] = v
+
+    if not session_timings:
+        return jsonify({"error": "No timings to export. Analyze surahs first."}), 400
 
     db_path = os.path.join(OUTPUT_DIR, f"{db_name}.db")
     zip_path = os.path.join(OUTPUT_DIR, f"{db_name}.db.zip")
@@ -288,9 +269,9 @@ def get_text(surah_number):
 
 @app.route("/api/uploaded-surahs", methods=["GET"])
 def list_uploaded():
-    """List all uploaded surah files."""
+    """List only surahs uploaded in this session."""
     uploaded = []
-    for surah_num in range(1, 115):
+    for surah_num in sorted(session_uploads):
         filepath = os.path.join(UPLOAD_DIR, f"{surah_num:03d}.mp3")
         if os.path.exists(filepath):
             size_mb = os.path.getsize(filepath) / (1024 * 1024)
