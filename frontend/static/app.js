@@ -11,15 +11,88 @@ let durationMs = 0;
 let surahs = [];
 let uploadedFiles = [];
 let dragMarker = null;
+let dragMarkerStartTime = null;
+let dragTrimHandle = null;
 let zoomLevel = 1;
 let trimStartMs = 0;
 let trimEndMs = 0;
+let manualAnchorAyahs = new Set();
+let reflowRequestId = 0;
+let waveformCache = new Map();
+let waveformFetchRequestId = 0;
+let waveformDetailTimer = null;
+
+const BASE_WAVEFORM_POINTS = 2000;
+const WAVEFORM_DETAIL_LEVELS = [2000, 4000, 8000, 12000, 16000];
+const WAVEFORM_DETAIL_DEBOUNCE_MS = 260;
+const MAX_ZOOM_LEVEL = 60;
 
 const audioPlayer = document.getElementById('audio-player');
 const waveformCanvas = document.getElementById('waveform-canvas');
 const markersOverlay = document.getElementById('markers-overlay');
 const playhead = document.getElementById('playhead');
 const ctx = waveformCanvas.getContext('2d');
+
+function setPlayButtonState(isPlaying) {
+  const btn = document.getElementById('btn-play');
+  btn.setAttribute('aria-label', isPlaying ? 'Pause' : 'Play');
+  btn.setAttribute('title', isPlaying ? 'Pause' : 'Play');
+  btn.innerHTML = isPlaying
+    ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 6h4v12H7zM13 6h4v12h-4z"></path></svg>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6v12l10-6z"></path></svg>';
+}
+
+function isReflowableAyah(ayah) {
+  return ayah > 0 && ayah < 999;
+}
+
+function getTimingIndexByAyah(ayah) {
+  return currentTimings.findIndex(t => t.ayah === ayah);
+}
+
+function getTimingEntryByAyah(ayah) {
+  return currentTimings.find(t => t.ayah === ayah) || null;
+}
+
+function getLastAyahNumber() {
+  return currentTimings.reduce((maxAyah, entry) => (
+    entry.ayah !== 0 && entry.ayah !== 999 ? Math.max(maxAyah, entry.ayah) : maxAyah
+  ), 0);
+}
+
+function getNextFixedAyah(anchorAyah) {
+  const nextManual = [...manualAnchorAyahs]
+    .filter(ayah => ayah > anchorAyah)
+    .sort((a, b) => a - b)[0];
+  return nextManual || 999;
+}
+
+function getMaxAnchorTime(anchorAyah, nextFixedAyah) {
+  const nextEntry = getTimingEntryByAyah(nextFixedAyah);
+  if (!nextEntry) return durationMs;
+  const lastSegmentAyah = nextFixedAyah === 999 ? getLastAyahNumber() : nextFixedAyah - 1;
+  const futureAyahs = Math.max(0, lastSegmentAyah - anchorAyah);
+  return nextEntry.time - (futureAyahs + 1) * 100;
+}
+
+function clampMarkerTime(index, proposedTime) {
+  const entry = currentTimings[index];
+  if (!entry) return proposedTime;
+
+  const prevEntry = currentTimings[index - 1];
+  const minGap = prevEntry && prevEntry.ayah === 0 && entry.ayah === 1 ? 0 : 100;
+  const minTime = prevEntry ? prevEntry.time + minGap : 0;
+
+  let maxTime;
+  if (isReflowableAyah(entry.ayah)) {
+    maxTime = getMaxAnchorTime(entry.ayah, getNextFixedAyah(entry.ayah));
+  } else {
+    const nextEntry = currentTimings[index + 1];
+    maxTime = nextEntry ? nextEntry.time - 100 : durationMs;
+  }
+
+  return Math.max(minTime, Math.min(proposedTime, Math.max(minTime, maxTime)));
+}
 
 // ── IndexedDB for audio blobs ───────────────────────────────────────
 const DB_NAME = 'AyahSplitterDB';
@@ -102,12 +175,69 @@ function clearAllTimingsLocal() {
   localStorage.removeItem(LS_KEY);
 }
 
+function getWaveformCacheKey(surahNum, points) {
+  return `${surahNum}:${points}`;
+}
+
+function normalizeWaveformPoints(points) {
+  for (const level of WAVEFORM_DETAIL_LEVELS) {
+    if (points <= level) return level;
+  }
+  return WAVEFORM_DETAIL_LEVELS[WAVEFORM_DETAIL_LEVELS.length - 1];
+}
+
+function getDesiredWaveformPoints() {
+  if (zoomLevel <= 2) return 2000;
+  if (zoomLevel <= 5) return 4000;
+  if (zoomLevel <= 10) return 8000;
+  if (zoomLevel <= 18) return 12000;
+  return 16000;
+}
+
+async function fetchWaveformData(surahNum, points = BASE_WAVEFORM_POINTS) {
+  const targetPoints = normalizeWaveformPoints(points);
+  const cacheKey = getWaveformCacheKey(surahNum, targetPoints);
+  if (waveformCache.has(cacheKey)) return waveformCache.get(cacheKey);
+
+  const res = await fetch(`${API}/api/waveform/${surahNum}?points=${targetPoints}`);
+  if (!res.ok) throw new Error('Audio not found. Upload first.');
+
+  const data = await res.json();
+  waveformCache.set(cacheKey, data);
+  return data;
+}
+
+function scheduleWaveformDetailRefresh() {
+  if (!currentSurah || !durationMs) return;
+
+  const targetPoints = getDesiredWaveformPoints();
+  if (waveformData.length >= targetPoints) return;
+
+  clearTimeout(waveformDetailTimer);
+  waveformDetailTimer = setTimeout(async () => {
+    const surahAtRequest = currentSurah;
+    const requestId = ++waveformFetchRequestId;
+
+    try {
+      const data = await fetchWaveformData(surahAtRequest, targetPoints);
+      if (surahAtRequest !== currentSurah || requestId !== waveformFetchRequestId) return;
+      if (data.waveform.length <= waveformData.length) return;
+
+      waveformData = data.waveform;
+      renderWaveform();
+    } catch (e) {
+      if (surahAtRequest === currentSurah) console.warn('Waveform detail refresh failed:', e);
+    }
+  }, WAVEFORM_DETAIL_DEBOUNCE_MS);
+}
+
 // ── Init ────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   await loadMetadata();
   setupDropZone();
   setupAudioEvents();
   setupWaveformInteraction();
+  setupKeyboardShortcuts();
   onBasmallahModeChange();
   updateSavedSummary();
 });
@@ -121,13 +251,11 @@ async function loadMetadata() {
     surahs.forEach(s => {
       const opt = document.createElement('option');
       opt.value = s.number;
-      opt.textContent = `${s.number}. ${s.name} (${s.ayah_count} ayahs)`;
+      opt.textContent = `${s.number}. ${s.name}`;
       sel.appendChild(opt);
     });
   });
 }
-
-function togglePreferences() { document.getElementById('preferences-panel').classList.toggle('hidden'); }
 
 // ── Upload ──────────────────────────────────────────────────────────
 function setupDropZone() {
@@ -205,16 +333,21 @@ function renderUploadedList() {
   const bar = document.getElementById('upload-status');
   if (!uploadedFiles.length) { list.classList.add('hidden'); bar.classList.add('hidden'); return; }
   bar.classList.remove('hidden');
-  document.getElementById('upload-count').textContent = `${uploadedFiles.length} file(s)`;
+  document.getElementById('upload-count').textContent = `${uploadedFiles.length} files`;
   list.classList.remove('hidden');
   list.innerHTML = uploadedFiles.map(f => {
     const cls = f.status === 'analyzing' ? 'analyzing' : f.status === 'analyzed' ? 'analyzed' : 'pending';
-    const txt = f.status === 'analyzing' ? '<span class="spinner"></span> Analyzing...' : f.status === 'analyzed' ? 'Analyzed' : 'Ready';
-    return `<div class="file-item"><span>${f.surah}. ${f.name} (${f.size_mb} MB)</span><span class="file-status ${cls}">${txt}</span></div>`;
+    const txt = f.status === 'analyzing' ? '<span class="spinner"></span> Analyzing' : f.status === 'analyzed' ? 'Ready' : 'Uploaded';
+    const active = currentSurah === f.surah ? 'active' : '';
+    return `<button type="button" class="file-item ${active}" onclick="openUploadedSurah(${f.surah})"><span class="file-main"><strong>${f.surah}</strong><span>${f.name}</span><small>${f.size_mb} MB</small></span><span class="file-status ${cls}">${txt}</span></button>`;
   }).join('');
 }
 
 function setFileStatus(s, st) { const f = uploadedFiles.find(x => x.surah === s); if (f) { f.status = st; renderUploadedList(); } }
+function openUploadedSurah(surahNum) {
+  document.getElementById('surah-select').value = surahNum;
+  loadSurah(surahNum);
+}
 
 // ── Surah Editor ────────────────────────────────────────────────────
 async function loadSurah(surahNum) {
@@ -222,9 +355,13 @@ async function loadSurah(surahNum) {
   surahNum = parseInt(surahNum);
   currentSurah = surahNum;
   currentTimings = []; currentSilences = []; currentAyahText = {};
+  manualAnchorAyahs = new Set();
+  waveformCache = new Map();
+  clearTimeout(waveformDetailTimer);
+  waveformFetchRequestId += 1;
   trimStartMs = 0; trimEndMs = 0;
-  document.getElementById('trim-start').value = 0;
-  document.getElementById('trim-end').value = 0;
+  document.getElementById('trim-start-readout').textContent = '0:00.000';
+  document.getElementById('trim-end-readout').textContent = '0:00.000';
   document.getElementById('basmallah-mode').value = 'auto';
   document.getElementById('manual-basmallah-end').value = '';
   onBasmallahModeChange();
@@ -232,9 +369,13 @@ async function loadSurah(surahNum) {
   // Check if we have saved timings in localStorage
   const saved = loadAllTimingsFromLocal()[surahNum];
 
-  const waveRes = await fetch(`${API}/api/waveform/${surahNum}?points=2000`);
-  if (!waveRes.ok) { showToast('Audio not found. Upload first.', 'error'); return; }
-  const wd = await waveRes.json();
+  let wd;
+  try {
+    wd = await fetchWaveformData(surahNum, BASE_WAVEFORM_POINTS);
+  } catch (e) {
+    showToast(e.message, 'error');
+    return;
+  }
   waveformData = wd.waveform; durationMs = wd.duration_ms;
 
   audioPlayer.src = `${API}/api/audio/${surahNum}`;
@@ -260,17 +401,17 @@ async function loadSurah(surahNum) {
     if (saved.trim) {
       trimStartMs = saved.trim.start || 0;
       trimEndMs = saved.trim.end || 0;
-      document.getElementById('trim-start').value = trimStartMs;
-      document.getElementById('trim-end').value = trimEndMs;
     }
     renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays();
   } else {
     si.classList.add('hidden');
     markersOverlay.innerHTML = '';
     document.getElementById('timing-tbody').innerHTML =
-      '<tr><td colspan="5" style="text-align:center;color:var(--text-dim);padding:1.5rem">Click "Analyze" to detect ayah boundaries</td></tr>';
+      '<tr><td colspan="5" style="text-align:center;color:var(--text-dim);padding:1.5rem">Analyze to place markers.</td></tr>';
     renderWaveform(); updateTrimOverlays();
   }
+  scheduleWaveformDetailRefresh();
+  renderUploadedList();
 }
 
 async function analyzeCurrent() {
@@ -306,6 +447,7 @@ async function analyzeCurrent() {
 
     const d = await res.json();
     currentTimings = d.timings; currentSilences = d.silences || []; currentAyahText = d.ayah_text || {};
+    manualAnchorAyahs = new Set();
 
     if (d.basmallah_detected != null) {
       showToast(d.basmallah_detected ? 'Basmallah detected' : 'No Basmallah detected', d.basmallah_detected ? 'success' : 'info');
@@ -330,7 +472,7 @@ async function analyzeCurrent() {
     }
 
     setFileStatus(currentSurah, 'analyzed');
-    renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays();
+    renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays(); highlightActiveRow();
   } catch (e) { showToast('Error: ' + e.message, 'error'); setFileStatus(currentSurah, 'uploaded'); }
   finally { btn.disabled = false; btn.textContent = 'Analyze'; }
 }
@@ -347,8 +489,8 @@ function saveToLocal() {
 function updateSavedSummary() {
   const saved = getSavedSurahs();
   const el = document.getElementById('saved-surahs-summary');
-  if (!saved.length) { el.innerHTML = '<span style="color:var(--text-dim)">No surahs saved yet. Analyze and save surahs above.</span>'; return; }
-  el.innerHTML = `<strong>${saved.length}</strong> surah(s) ready to export: ` +
+  if (!saved.length) { el.innerHTML = '<span style="color:var(--text-dim)">Nothing saved yet.</span>'; return; }
+  el.innerHTML = `<strong>${saved.length}</strong> saved ` +
     saved.map(n => `<span class="surah-chip">${n}. ${surahs.find(s=>s.number===n)?.name||n}</span>`).join('');
 }
 
@@ -363,9 +505,35 @@ function clearAllLocal() {
 
 // ── Trim ────────────────────────────────────────────────────────────
 function onTrimChange() {
-  trimStartMs = parseInt(document.getElementById('trim-start').value) || 0;
-  trimEndMs = parseInt(document.getElementById('trim-end').value) || 0;
+  trimStartMs = Math.max(0, trimStartMs || 0);
+  trimEndMs = Math.max(0, trimEndMs || 0);
+  if (durationMs > 0) {
+    const maxStart = Math.max(0, durationMs - trimEndMs - 100);
+    trimStartMs = Math.min(trimStartMs, maxStart);
+    const maxEnd = Math.max(0, durationMs - trimStartMs - 100);
+    trimEndMs = Math.min(trimEndMs, maxEnd);
+  }
   updateTrimOverlays();
+}
+
+function setTrimFromPlayhead(side) {
+  if (!durationMs) return;
+  const playheadMs = Math.round(audioPlayer.currentTime * 1000);
+  if (side === 'start') {
+    const maxStart = Math.max(0, durationMs - trimEndMs - 100);
+    trimStartMs = Math.min(playheadMs, maxStart);
+  } else {
+    const minOutPoint = trimStartMs + 100;
+    const outPoint = Math.max(minOutPoint, Math.min(playheadMs, durationMs));
+    trimEndMs = Math.max(0, durationMs - outPoint);
+  }
+  onTrimChange();
+}
+
+function resetTrim() {
+  trimStartMs = 0;
+  trimEndMs = 0;
+  onTrimChange();
 }
 
 function onBasmallahModeChange() {
@@ -396,15 +564,30 @@ function updateTrimOverlays() {
   if (!durationMs) return;
   const sl = document.getElementById('trim-start-overlay');
   const sr = document.getElementById('trim-end-overlay');
+  const sh = document.getElementById('trim-start-handle');
+  const eh = document.getElementById('trim-end-handle');
+  const trimEndPointMs = Math.max(trimStartMs + 100, durationMs - trimEndMs);
   sl.style.width = `${(trimStartMs / durationMs) * 100}%`;
   sr.style.width = `${(trimEndMs / durationMs) * 100}%`;
+  sh.style.left = `${(trimStartMs / durationMs) * 100}%`;
+  eh.style.left = `${(trimEndPointMs / durationMs) * 100}%`;
+  document.getElementById('trim-start-readout').textContent = `In ${formatTime(trimStartMs)}`;
+  document.getElementById('trim-end-readout').textContent = `Out ${formatTime(trimEndPointMs)}`;
 }
 
 // ── Zoom ────────────────────────────────────────────────────────────
-function zoomIn() { setZoom(Math.min(zoomLevel * 1.5, 30)); }
+function zoomIn() { setZoom(Math.min(zoomLevel * 1.5, MAX_ZOOM_LEVEL)); }
 function zoomOut() { setZoom(Math.max(zoomLevel / 1.5, 1)); }
 function zoomReset() { setZoom(1); }
-function setZoom(l) { zoomLevel = l; document.getElementById('zoom-level').textContent = `${Math.round(l*100)}%`; renderWaveform(); renderMarkers(); updateTrimOverlays(); scrollToPlayhead(); }
+function setZoom(l) {
+  zoomLevel = l;
+  document.getElementById('zoom-level').textContent = `${Math.round(l * 100)}%`;
+  renderWaveform();
+  renderMarkers();
+  updateTrimOverlays();
+  scrollToPlayhead();
+  scheduleWaveformDetailRefresh();
+}
 function scrollToPlayhead() {
   const sc = document.getElementById('waveform-scroll');
   const ct = document.getElementById('waveform-container');
@@ -417,11 +600,13 @@ function scrollToPlayhead() {
 function renderWaveform() {
   const sc = document.getElementById('waveform-scroll');
   const ct = document.getElementById('waveform-container');
+  if (!waveformData.length) return;
   const vw = sc.clientWidth;
   const tw = vw * zoomLevel;
   ct.style.width = `${tw}px`;
-  const dpr = window.devicePixelRatio || 1;
-  const h = 170;
+  const deviceDpr = window.devicePixelRatio || 1;
+  const dpr = tw > 24000 ? 1 : tw > 12000 ? Math.min(deviceDpr, 1.5) : deviceDpr;
+  const h = ct.clientHeight || 220;
   waveformCanvas.width = tw * dpr; waveformCanvas.height = h * dpr;
   waveformCanvas.style.width = `${tw}px`; waveformCanvas.style.height = `${h}px`;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -430,7 +615,10 @@ function renderWaveform() {
   ctx.fillStyle = 'rgba(56,217,169,0.08)';
   for (const [s, e] of currentSilences) { ctx.fillRect((s/durationMs)*tw, 0, ((e-s)/durationMs)*tw, h); }
   ctx.fillStyle = '#4f8cff';
-  for (let i = 0; i < waveformData.length; i++) { const bh = waveformData[i]*(h*0.8); ctx.fillRect(i*bw, mid-bh/2, Math.max(bw-0.5,0.5), bh); }
+  for (let i = 0; i < waveformData.length; i++) {
+    const bh = waveformData[i] * (h * 0.8);
+    ctx.fillRect(i * bw, mid - bh / 2, Math.max(bw - 0.35, 0.75), bh);
+  }
 }
 
 // ── Markers ─────────────────────────────────────────────────────────
@@ -447,8 +635,8 @@ function renderMarkers() {
     markersOverlay.appendChild(mk);
   }
 }
-function startDrag(e) { e.preventDefault(); dragMarker = e.currentTarget; dragMarker.classList.add('dragging'); document.addEventListener('mousemove', onDrag); document.addEventListener('mouseup', endDrag); }
-function startDragTouch(e) { e.preventDefault(); dragMarker = e.currentTarget; dragMarker.classList.add('dragging'); document.addEventListener('touchmove', onDragTouch, {passive:false}); document.addEventListener('touchend', endDragTouch); }
+function startDrag(e) { e.preventDefault(); dragMarker = e.currentTarget; dragMarkerStartTime = currentTimings[parseInt(dragMarker.dataset.index)]?.time ?? null; dragMarker.classList.add('dragging'); document.addEventListener('mousemove', onDrag); document.addEventListener('mouseup', endDrag); }
+function startDragTouch(e) { e.preventDefault(); dragMarker = e.currentTarget; dragMarkerStartTime = currentTimings[parseInt(dragMarker.dataset.index)]?.time ?? null; dragMarker.classList.add('dragging'); document.addEventListener('touchmove', onDragTouch, {passive:false}); document.addEventListener('touchend', endDragTouch); }
 function onDrag(e) { if (dragMarker) updateMarkerPos(e.clientX); }
 function onDragTouch(e) { if (dragMarker) { e.preventDefault(); updateMarkerPos(e.touches[0].clientX); } }
 function updateMarkerPos(cx) {
@@ -457,30 +645,245 @@ function updateMarkerPos(cx) {
   let pct = Math.max(0, Math.min(100, ((cx - r.left) / ct.offsetWidth) * 100));
   dragMarker.style.left = `${pct}%`;
   const idx = parseInt(dragMarker.dataset.index);
-  currentTimings[idx].time = Math.round((pct/100)*durationMs);
+  currentTimings[idx].time = clampMarkerTime(idx, Math.round((pct / 100) * durationMs));
+  dragMarker.style.left = `${(currentTimings[idx].time / durationMs) * 100}%`;
   updateTimingRow(idx, currentTimings[idx].time);
 }
-function endDrag() { if (dragMarker) dragMarker.classList.remove('dragging'); dragMarker = null; document.removeEventListener('mousemove', onDrag); document.removeEventListener('mouseup', endDrag); }
-function endDragTouch() { if (dragMarker) dragMarker.classList.remove('dragging'); dragMarker = null; document.removeEventListener('touchmove', onDragTouch); document.removeEventListener('touchend', endDragTouch); }
+async function endDrag() {
+  const idx = dragMarker ? parseInt(dragMarker.dataset.index) : null;
+  const moved = idx != null && dragMarkerStartTime != null && currentTimings[idx]?.time !== dragMarkerStartTime;
+  if (dragMarker) dragMarker.classList.remove('dragging');
+  dragMarker = null;
+  dragMarkerStartTime = null;
+  document.removeEventListener('mousemove', onDrag);
+  document.removeEventListener('mouseup', endDrag);
+  if (moved) await reflowFromManualAdjustment(idx);
+}
+async function endDragTouch() {
+  const idx = dragMarker ? parseInt(dragMarker.dataset.index) : null;
+  const moved = idx != null && dragMarkerStartTime != null && currentTimings[idx]?.time !== dragMarkerStartTime;
+  if (dragMarker) dragMarker.classList.remove('dragging');
+  dragMarker = null;
+  dragMarkerStartTime = null;
+  document.removeEventListener('touchmove', onDragTouch);
+  document.removeEventListener('touchend', endDragTouch);
+  if (moved) await reflowFromManualAdjustment(idx);
+}
+
+function startTrimDrag(e, side) {
+  e.preventDefault();
+  e.stopPropagation();
+  dragTrimHandle = side;
+  document.addEventListener('mousemove', onTrimDrag);
+  document.addEventListener('mouseup', endTrimDrag);
+}
+
+function startTrimDragTouch(e, side) {
+  e.preventDefault();
+  e.stopPropagation();
+  dragTrimHandle = side;
+  document.addEventListener('touchmove', onTrimDragTouch, { passive: false });
+  document.addEventListener('touchend', endTrimDragTouch);
+}
+
+function onTrimDrag(e) {
+  if (!dragTrimHandle) return;
+  updateTrimHandlePos(e.clientX);
+}
+
+function onTrimDragTouch(e) {
+  if (!dragTrimHandle) return;
+  e.preventDefault();
+  updateTrimHandlePos(e.touches[0].clientX);
+}
+
+function updateTrimHandlePos(clientX) {
+  const ct = document.getElementById('waveform-container');
+  const rect = ct.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (clientX - rect.left) / ct.offsetWidth));
+  const ms = Math.round(pct * durationMs);
+
+  if (dragTrimHandle === 'start') {
+    const maxStart = Math.max(0, durationMs - trimEndMs - 100);
+    trimStartMs = Math.min(ms, maxStart);
+  } else {
+    const minOut = trimStartMs + 100;
+    const outPoint = Math.max(minOut, Math.min(ms, durationMs));
+    trimEndMs = Math.max(0, durationMs - outPoint);
+  }
+
+  onTrimChange();
+}
+
+function endTrimDrag() {
+  dragTrimHandle = null;
+  document.removeEventListener('mousemove', onTrimDrag);
+  document.removeEventListener('mouseup', endTrimDrag);
+}
+
+function endTrimDragTouch() {
+  dragTrimHandle = null;
+  document.removeEventListener('touchmove', onTrimDragTouch);
+  document.removeEventListener('touchend', endTrimDragTouch);
+}
 
 // ── Waveform Click + Wheel ──────────────────────────────────────────
 function setupWaveformInteraction() {
   const ct = document.getElementById('waveform-container');
   const sc = document.getElementById('waveform-scroll');
-  ct.addEventListener('click', e => { if (dragMarker) return; audioPlayer.currentTime = ((e.clientX - ct.getBoundingClientRect().left) / ct.offsetWidth) * (durationMs/1000); });
-  sc.addEventListener('wheel', e => { if (e.ctrlKey || e.metaKey) { e.preventDefault(); setZoom(Math.max(1, Math.min(30, zoomLevel * (e.deltaY > 0 ? 0.8 : 1.25)))); } }, { passive: false });
-  window.addEventListener('resize', () => { if (waveformData.length) { renderWaveform(); renderMarkers(); updateTrimOverlays(); } });
+  const sh = document.getElementById('trim-start-handle');
+  const eh = document.getElementById('trim-end-handle');
+  sh.addEventListener('mousedown', e => startTrimDrag(e, 'start'));
+  eh.addEventListener('mousedown', e => startTrimDrag(e, 'end'));
+  sh.addEventListener('touchstart', e => startTrimDragTouch(e, 'start'), { passive: false });
+  eh.addEventListener('touchstart', e => startTrimDragTouch(e, 'end'), { passive: false });
+  ct.addEventListener('click', e => {
+    if (dragMarker || dragTrimHandle || e.target.closest('.marker, .trim-handle')) return;
+    audioPlayer.currentTime = ((e.clientX - ct.getBoundingClientRect().left) / ct.offsetWidth) * (durationMs/1000);
+  });
+  sc.addEventListener('wheel', e => { if (e.ctrlKey || e.metaKey) { e.preventDefault(); setZoom(Math.max(1, Math.min(MAX_ZOOM_LEVEL, zoomLevel * (e.deltaY > 0 ? 0.8 : 1.25)))); } }, { passive: false });
+  window.addEventListener('resize', () => {
+    if (waveformData.length) {
+      renderWaveform();
+      renderMarkers();
+      updateTrimOverlays();
+      scheduleWaveformDetailRefresh();
+    }
+  });
+}
+
+async function reflowFromManualAdjustment(index) {
+  const entry = currentTimings[index];
+  if (!entry || !isReflowableAyah(entry.ayah)) {
+    renderMarkers();
+    renderTimingTable();
+    highlightActiveRow();
+    return;
+  }
+
+  manualAnchorAyahs.add(entry.ayah);
+  const nextFixedAyah = getNextFixedAyah(entry.ayah);
+  const requestId = ++reflowRequestId;
+
+  try {
+    const res = await fetch(`${API}/api/reflow/${currentSurah}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timings: currentTimings,
+        silences: currentSilences,
+        anchor_ayah: entry.ayah,
+        next_fixed_ayah: nextFixedAyah,
+      }),
+    });
+    const data = await res.json();
+    if (requestId !== reflowRequestId) return;
+    if (!res.ok || !data.success) throw new Error(data.error || 'Reflow failed');
+
+    currentTimings = data.timings;
+    renderMarkers();
+    renderTimingTable();
+    highlightActiveRow();
+  } catch (e) {
+    showToast(`Reflow failed: ${e.message}`, 'error');
+    renderMarkers();
+    renderTimingTable();
+    highlightActiveRow();
+  }
+}
+
+function setupKeyboardShortcuts() {
+  document.addEventListener('keydown', e => {
+    if (!currentSurah && !(e.metaKey || e.ctrlKey)) return;
+    if (isTypingTarget(e.target)) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        saveToLocal();
+      }
+      return;
+    }
+
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      saveToLocal();
+      return;
+    }
+
+    if (e.key === ' ') {
+      e.preventDefault();
+      togglePlay();
+      return;
+    }
+
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      prevAyah();
+      return;
+    }
+
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      nextAyah();
+      return;
+    }
+
+    if (e.key === '[') {
+      e.preventDefault();
+      setTrimFromPlayhead('start');
+      return;
+    }
+
+    if (e.key === ']') {
+      e.preventDefault();
+      setTrimFromPlayhead('end');
+      return;
+    }
+
+    if (e.key === '\\') {
+      e.preventDefault();
+      resetTrim();
+      return;
+    }
+
+    if (e.key.toLowerCase() === 'a') {
+      e.preventDefault();
+      analyzeCurrent();
+      return;
+    }
+
+    if (e.key === '+' || e.key === '=') {
+      e.preventDefault();
+      zoomIn();
+      return;
+    }
+
+    if (e.key === '-' || e.key === '_') {
+      e.preventDefault();
+      zoomOut();
+      return;
+    }
+
+    if (e.key === '0') {
+      e.preventDefault();
+      zoomReset();
+    }
+  });
+}
+
+function isTypingTarget(target) {
+  return Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
 }
 
 // ── Audio ───────────────────────────────────────────────────────────
 function setupAudioEvents() {
   audioPlayer.addEventListener('timeupdate', () => { updatePlayhead(); updateTimeDisplay(); highlightActiveRow(); });
-  audioPlayer.addEventListener('play', () => { playhead.style.display = 'block'; document.getElementById('btn-play').textContent = 'Pause'; });
-  audioPlayer.addEventListener('pause', () => { document.getElementById('btn-play').textContent = 'Play'; });
-  audioPlayer.addEventListener('ended', () => { playhead.style.display = 'none'; document.getElementById('btn-play').textContent = 'Play'; });
+  audioPlayer.addEventListener('play', () => { playhead.style.display = 'block'; setPlayButtonState(true); });
+  audioPlayer.addEventListener('pause', () => { setPlayButtonState(false); });
+  audioPlayer.addEventListener('ended', () => { playhead.style.display = 'none'; setPlayButtonState(false); });
+  setPlayButtonState(false);
 }
 function togglePlay() { audioPlayer.paused ? audioPlayer.play() : audioPlayer.pause(); }
-function stopAudio() { audioPlayer.pause(); audioPlayer.currentTime = 0; playhead.style.display = 'none'; document.getElementById('btn-play').textContent = 'Play'; document.getElementById('current-ayah-label').textContent = ''; }
+function stopAudio() { audioPlayer.pause(); audioPlayer.currentTime = 0; playhead.style.display = 'none'; setPlayButtonState(false); document.getElementById('current-ayah-label').textContent = ''; }
 function setPlaybackSpeed(v) { audioPlayer.playbackRate = parseFloat(v); }
 
 function prevAyah() {
@@ -533,16 +936,21 @@ function renderTimingTable() {
     const lbl = t.ayah === 0 ? 'Basmallah' : t.ayah === 999 ? 'End' : t.ayah;
     const txt = currentAyahText[String(t.ayah)] || '';
     const th = txt ? `<span class="ayah-text">${esc(txt)}</span>` : '<span style="color:var(--text-dim)">-</span>';
-    tr.innerHTML = `<td>${lbl}</td><td>${th}</td><td><input type="number" value="${t.time}" min="0" max="${durationMs}" data-index="${idx}" onchange="onTimingInput(this)"></td><td>${formatTime(t.time)}</td><td><button class="btn btn-sm" onclick="seekTo(${t.time})">Seek</button> <button class="btn btn-sm" onclick="playFrom(${idx})">Play</button></td>`;
+    tr.innerHTML = `<td>${lbl}</td><td>${th}</td><td><input type="number" value="${t.time}" min="0" max="${durationMs}" data-index="${idx}" onchange="onTimingInput(this)"></td><td>${formatTime(t.time)}</td><td><button class="btn btn-sm" onclick="seekTo(${t.time})">Go</button> <button class="btn btn-sm" onclick="playFrom(${idx})">Play</button></td>`;
     tr.addEventListener('click', e => { if (e.target.tagName !== 'BUTTON' && e.target.tagName !== 'INPUT') seekTo(t.time); });
     tb.appendChild(tr);
   });
 }
 function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-function onTimingInput(inp) {
-  const i = parseInt(inp.dataset.index); currentTimings[i].time = parseInt(inp.value);
+async function onTimingInput(inp) {
+  const i = parseInt(inp.dataset.index, 10);
+  const proposedTime = parseInt(inp.value, 10);
+  const safeTime = Number.isFinite(proposedTime) ? proposedTime : currentTimings[i].time;
+  currentTimings[i].time = clampMarkerTime(i, safeTime);
+  inp.value = currentTimings[i].time;
   inp.closest('tr').querySelectorAll('td')[3].textContent = formatTime(currentTimings[i].time);
   renderMarkers();
+  await reflowFromManualAdjustment(i);
 }
 function updateTimingRow(i, v) {
   const inp = document.querySelector(`#timing-tbody input[data-index="${i}"]`);

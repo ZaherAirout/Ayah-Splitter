@@ -157,6 +157,20 @@ def _get_ayah_weights(surah_number: int) -> list[float]:
     return [1.0 / num_ayahs] * num_ayahs
 
 
+def _get_segment_weights(
+    surah_number: int,
+    start_ayah: int,
+    end_ayah: int,
+) -> list[float]:
+    """Return normalized weights for an inclusive ayah slice."""
+    all_weights = _get_ayah_weights(surah_number)
+    segment = all_weights[start_ayah - 1:end_ayah]
+    total = sum(segment)
+    if not segment or total <= 0:
+        return []
+    return [weight / total for weight in segment]
+
+
 def _estimate_positions(
     num_splits: int,
     content_start_ms: int,
@@ -395,6 +409,78 @@ def _enforce_ordering(timings: list[dict]):
     for i in range(2, len(timings)):
         if timings[i]["time"] <= timings[i - 1]["time"]:
             timings[i]["time"] = timings[i - 1]["time"] + 100
+
+
+def reflow_timings_from_anchor(
+    surah_number: int,
+    timings: list[dict],
+    silences: list[list[int] | tuple[int, int]],
+    anchor_ayah: int,
+    next_fixed_ayah: int = 999,
+) -> list[dict]:
+    """
+    Re-estimate ayah starts after a manually moved anchor.
+
+    Keeps ayahs up to `anchor_ayah` fixed and recomputes later ayahs until
+    `next_fixed_ayah` (or the end marker 999) using the existing weighting
+    and silence snapping logic.
+    """
+    num_ayahs = AYAH_COUNTS[surah_number]
+    if anchor_ayah < 1 or anchor_ayah > num_ayahs:
+        raise ValueError("anchor_ayah must be between 1 and the last ayah")
+    if next_fixed_ayah != 999 and (next_fixed_ayah <= anchor_ayah or next_fixed_ayah > num_ayahs):
+        raise ValueError("next_fixed_ayah must be greater than anchor_ayah or 999")
+
+    entries = [dict(entry) for entry in timings]
+    entries.sort(key=lambda t: (t["ayah"] if t["ayah"] != 999 else 99999))
+    by_ayah = {entry["ayah"]: entry for entry in entries}
+
+    if anchor_ayah not in by_ayah or 999 not in by_ayah:
+        raise ValueError("timings must include the anchor ayah and 999 end marker")
+    if next_fixed_ayah != 999 and next_fixed_ayah not in by_ayah:
+        raise ValueError("timings must include the requested next_fixed_ayah")
+
+    anchor_time_ms = int(by_ayah[anchor_ayah]["time"])
+    segment_end_ms = int(by_ayah[next_fixed_ayah]["time"] if next_fixed_ayah != 999 else by_ayah[999]["time"])
+    last_segment_ayah = num_ayahs if next_fixed_ayah == 999 else next_fixed_ayah - 1
+    remaining_boundaries = max(0, last_segment_ayah - anchor_ayah)
+
+    min_required_gap = 100 * (remaining_boundaries + 1)
+    if segment_end_ms - anchor_time_ms < min_required_gap:
+        raise ValueError("Not enough room after the moved ayah to reflow later ayahs")
+
+    clean_silences = [(int(s), int(e)) for s, e in silences]
+    eff_silences = [
+        (s, e) for s, e in clean_silences
+        if s >= anchor_time_ms and e <= segment_end_ms
+    ]
+
+    if remaining_boundaries > 0:
+        segment_weights = _get_segment_weights(surah_number, anchor_ayah, last_segment_ayah)
+        estimates = _estimate_positions(
+            remaining_boundaries,
+            anchor_time_ms,
+            segment_end_ms,
+            segment_weights,
+        )
+        search_range_ms = _get_boundary_search_range(
+            anchor_time_ms,
+            segment_end_ms,
+            len(segment_weights) or (remaining_boundaries + 1),
+        )
+        snapped = _snap_to_silences(
+            estimates,
+            eff_silences,
+            search_range_ms=search_range_ms,
+        )
+
+        prev = anchor_time_ms
+        for ayah, time_ms in zip(range(anchor_ayah + 1, last_segment_ayah + 1), snapped):
+            by_ayah[ayah]["time"] = max(int(time_ms), prev + 100)
+            prev = by_ayah[ayah]["time"]
+
+    result = [by_ayah[ayah] for ayah in sorted(by_ayah, key=lambda ayah: ayah if ayah != 999 else 99999)]
+    return result
 
 
 def analyze_surah(

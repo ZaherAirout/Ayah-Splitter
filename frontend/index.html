@@ -8,134 +8,167 @@
 </head>
 <body>
   <header>
-    <h1>Ayah Splitter</h1>
-    <p class="subtitle">Generate ayah timing databases for Quran Android</p>
+    <div>
+      <p class="eyebrow">Simple timing editor</p>
+      <h1>Ayah Splitter</h1>
+    </div>
   </header>
 
-  <main>
-    <!-- Step 1: Upload & Select -->
-    <section id="upload-section" class="card">
-      <h2>1. Upload & Select Surah</h2>
+  <main class="app-layout">
+    <aside class="sidebar">
+      <section id="upload-section" class="card side-card">
+        <div class="section-head">
+          <h2>Audio</h2>
+          <span class="section-note">Upload once, edit fast.</span>
+        </div>
 
-      <div class="single-upload">
-        <select id="upload-surah-select">
-          <option value="">-- Select surah --</option>
-        </select>
-        <input type="file" id="single-file-input" accept=".mp3" hidden>
-        <button class="btn btn-primary" onclick="document.getElementById('single-file-input').click()">Upload File</button>
-        <button class="btn btn-sm" id="btn-preferences" onclick="togglePreferences()">Preferences</button>
-      </div>
+        <div class="single-upload">
+          <select id="upload-surah-select">
+            <option value="">Pick surah</option>
+          </select>
+          <input type="file" id="single-file-input" accept=".mp3" hidden>
+          <button class="btn btn-primary" onclick="document.getElementById('single-file-input').click()">Upload</button>
+        </div>
 
-      <div class="upload-area" id="drop-zone">
-        <p>Or drag & drop multiple MP3 files (named 1.mp3 - 114.mp3)</p>
-        <input type="file" id="file-input" multiple accept=".mp3" hidden>
-        <button class="btn" onclick="document.getElementById('file-input').click()">Select Multiple</button>
-      </div>
+        <div class="upload-area" id="drop-zone">
+          <p>Drop MP3s</p>
+          <small>Batch files named 1.mp3 to 114.mp3.</small>
+          <input type="file" id="file-input" multiple accept=".mp3" hidden>
+          <button class="btn" onclick="document.getElementById('file-input').click()">Batch Upload</button>
+        </div>
 
-      <div id="preferences-panel" class="preferences-panel hidden">
-        <small>These are auto-tuned. Only change if results are poor.</small>
-      </div>
+        <div id="upload-status" class="status-bar hidden">
+          <span id="upload-count">0 files</span>
+          <button class="btn btn-sm" onclick="refreshUploadedList()">Refresh</button>
+        </div>
+        <div id="uploaded-list" class="file-list hidden"></div>
+      </section>
 
-      <div id="upload-status" class="status-bar hidden">
-        <span id="upload-count">0 file(s)</span>
-        <button class="btn btn-sm" onclick="refreshUploadedList()">Refresh</button>
-      </div>
-      <div id="uploaded-list" class="file-list hidden"></div>
-    </section>
+      <section id="export-section" class="card side-card export-card">
+        <div class="section-head">
+          <h2>Export</h2>
+          <span class="section-note">SQLite zip</span>
+        </div>
+        <div id="saved-surahs-summary"></div>
+        <div class="settings-grid compact-grid">
+          <div class="setting">
+            <label for="db-name">File</label>
+            <input type="text" id="db-name" value="gapless_timing">
+          </div>
+        </div>
+        <div class="actions tight-actions">
+          <button class="btn btn-primary" onclick="exportDb()">Export</button>
+          <button class="btn" id="btn-download" onclick="downloadExport()" disabled>Download</button>
+          <button class="btn btn-danger-outline" onclick="clearAllLocal()">Clear</button>
+        </div>
+        <div id="export-status" class="hidden"></div>
+      </section>
+    </aside>
 
-    <!-- Step 2: Editor -->
-    <section id="editor-section" class="card">
-      <h2>2. Analyze & Edit</h2>
-
-      <div class="surah-selector">
-        <label for="surah-select">Surah:</label>
-        <select id="surah-select" onchange="loadSurah(this.value)">
-          <option value="">-- Select --</option>
-        </select>
-        <button class="btn btn-primary" id="btn-analyze-surah" onclick="analyzeCurrent()" disabled>Analyze</button>
-        <span id="saved-indicator" class="saved-indicator hidden">Saved</span>
+    <section id="editor-section" class="card workspace">
+      <div class="workspace-bar">
+        <div class="surah-selector">
+          <select id="surah-select" onchange="loadSurah(this.value)">
+            <option value="">Pick surah</option>
+          </select>
+          <span id="saved-indicator" class="saved-indicator hidden">Saved</span>
+        </div>
+        <div class="workspace-actions">
+          <button class="btn btn-primary" id="btn-analyze-surah" onclick="analyzeCurrent()" disabled>Analyze</button>
+          <button class="btn" onclick="saveToLocal()">Save</button>
+        </div>
       </div>
 
       <div id="editor-content" class="hidden">
-        <div class="editor-info">
-          <span id="editor-surah-name"></span>
-          <span id="editor-ayah-count"></span>
-          <span id="editor-duration"></span>
-          <span id="editor-basmallah" class="basmallah-badge"></span>
+        <div class="workspace-hero">
+          <div>
+            <h2 id="editor-surah-name"></h2>
+            <div class="editor-info">
+              <span id="editor-ayah-count" class="info-pill"></span>
+              <span id="editor-duration" class="info-pill"></span>
+              <span id="editor-basmallah" class="basmallah-badge"></span>
+            </div>
+          </div>
+          <div class="zoom-controls mini-controls">
+            <button class="btn btn-sm" onclick="zoomOut()">-</button>
+            <span id="zoom-level" class="zoom-label">100%</span>
+            <button class="btn btn-sm" onclick="zoomIn()">+</button>
+            <button class="btn btn-sm" onclick="zoomReset()">Fit</button>
+          </div>
         </div>
 
-        <div class="detection-controls">
-          <label>Opening:
+        <div class="control-strip">
+          <div class="detection-controls">
+            <label>Opening
             <select id="basmallah-mode" onchange="onBasmallahModeChange()">
               <option value="auto">Auto detect</option>
               <option value="present">Opening is Basmallah</option>
               <option value="absent">Opening is Ayah 1</option>
             </select>
-          </label>
-          <label id="manual-basmallah-wrap" class="hidden">Ayah 1 starts at:
-            <input type="number" id="manual-basmallah-end" min="0" step="100" placeholder="auto"> ms
-          </label>
-          <button class="btn btn-sm" id="btn-use-playhead" onclick="usePlayheadForBasmallah()" disabled>Use Playhead</button>
-          <button class="btn btn-sm hidden" id="btn-clear-basmallah" onclick="clearBasmallahManual()">Clear</button>
-          <small class="detection-help">Use this when the opening is misdetected.</small>
-        </div>
-
-        <!-- Trim Controls -->
-        <div class="trim-controls">
-          <label>Trim start:
-            <input type="number" id="trim-start" value="0" min="0" step="100" onchange="onTrimChange()"> ms
-          </label>
-          <label>Trim end:
-            <input type="number" id="trim-end" value="0" min="0" step="100" onchange="onTrimChange()"> ms
-          </label>
-          <div class="trim-visual">
-            <div id="trim-start-region" class="trim-region trim-left"></div>
-            <div id="trim-end-region" class="trim-region trim-right"></div>
+            </label>
+            <label id="manual-basmallah-wrap" class="hidden">Ayah 1
+              <input type="number" id="manual-basmallah-end" min="0" step="100" placeholder="auto"> ms
+            </label>
+            <button class="btn btn-sm" id="btn-use-playhead" onclick="usePlayheadForBasmallah()" disabled>Use Playhead</button>
+            <button class="btn btn-sm hidden" id="btn-clear-basmallah" onclick="clearBasmallahManual()">Clear</button>
           </div>
         </div>
 
-        <!-- Zoom -->
-        <div class="zoom-controls">
-          <button class="btn btn-sm" onclick="zoomIn()">+ Zoom In</button>
-          <button class="btn btn-sm" onclick="zoomOut()">- Zoom Out</button>
-          <button class="btn btn-sm" onclick="zoomReset()">Fit</button>
-          <span id="zoom-level" class="zoom-label">100%</span>
-        </div>
+        <div class="wave-shell">
+          <div class="audio-controls">
+            <audio id="audio-player" preload="auto"></audio>
+            <button class="btn btn-sm btn-icon" onclick="prevAyah()" title="Previous ayah" aria-label="Previous ayah">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 6h2v12H6zM18 6v12l-8-6z"></path>
+              </svg>
+            </button>
+            <button class="btn btn-primary btn-play btn-icon btn-icon-lg" onclick="togglePlay()" id="btn-play" title="Play or pause" aria-label="Play">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 6v12l10-6z"></path>
+              </svg>
+            </button>
+            <button class="btn btn-sm btn-icon" onclick="nextAyah()" title="Next ayah" aria-label="Next ayah">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M16 6h2v12h-2zM6 6l8 6-8 6z"></path>
+              </svg>
+            </button>
+            <button class="btn btn-sm btn-icon" onclick="stopAudio()" title="Stop" aria-label="Stop">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M7 7h10v10H7z"></path>
+              </svg>
+            </button>
+            <span id="audio-time">0:00 / 0:00</span>
+            <span id="current-ayah-label" class="current-ayah-label"></span>
+            <label class="playback-speed">
+              <span>Speed</span>
+              <select id="playback-speed" onchange="setPlaybackSpeed(this.value)">
+                <option value="0.5">0.5x</option>
+                <option value="0.75">0.75x</option>
+                <option value="1" selected>1x</option>
+                <option value="1.25">1.25x</option>
+                <option value="1.5">1.5x</option>
+                <option value="2">2x</option>
+              </select>
+            </label>
+          </div>
 
-        <!-- Waveform -->
-        <div id="waveform-scroll" class="waveform-scroll">
-          <div id="waveform-container">
-            <canvas id="waveform-canvas"></canvas>
-            <div id="markers-overlay"></div>
-            <div id="playhead" class="playhead"></div>
-            <div id="trim-start-overlay" class="trim-overlay-left"></div>
-            <div id="trim-end-overlay" class="trim-overlay-right"></div>
+          <div id="waveform-scroll" class="waveform-scroll">
+            <div id="waveform-container">
+              <canvas id="waveform-canvas"></canvas>
+              <div id="markers-overlay"></div>
+              <div id="playhead" class="playhead"></div>
+              <div id="trim-start-overlay" class="trim-overlay-left"></div>
+              <div id="trim-end-overlay" class="trim-overlay-right"></div>
+              <div id="trim-start-handle" class="trim-handle trim-handle-start" title="Trim start" aria-label="Trim start">
+                <span id="trim-start-readout" class="trim-handle-label">In 0:00.000</span>
+              </div>
+              <div id="trim-end-handle" class="trim-handle trim-handle-end" title="Trim end" aria-label="Trim end">
+                <span id="trim-end-readout" class="trim-handle-label">Out 0:00.000</span>
+              </div>
+            </div>
           </div>
         </div>
 
-        <!-- Audio Controls -->
-        <div class="audio-controls">
-          <audio id="audio-player" preload="auto"></audio>
-          <button class="btn btn-sm" onclick="prevAyah()">Prev</button>
-          <button class="btn btn-sm btn-play" onclick="togglePlay()" id="btn-play">Play</button>
-          <button class="btn btn-sm" onclick="nextAyah()">Next</button>
-          <button class="btn btn-sm" onclick="stopAudio()">Stop</button>
-          <span id="audio-time">0:00 / 0:00</span>
-          <span id="current-ayah-label" class="current-ayah-label"></span>
-          <label class="playback-speed">
-            Speed:
-            <select id="playback-speed" onchange="setPlaybackSpeed(this.value)">
-              <option value="0.5">0.5x</option>
-              <option value="0.75">0.75x</option>
-              <option value="1" selected>1x</option>
-              <option value="1.25">1.25x</option>
-              <option value="1.5">1.5x</option>
-              <option value="2">2x</option>
-            </select>
-          </label>
-        </div>
-
-        <!-- Timing Table -->
         <div class="timing-table-wrapper">
           <table id="timing-table">
             <thead>
@@ -150,35 +183,12 @@
             <tbody id="timing-tbody"></tbody>
           </table>
         </div>
-
-        <div class="actions">
-          <button class="btn btn-primary" onclick="saveToLocal()">Save Surah</button>
-          <button class="btn" onclick="analyzeCurrent()">Re-analyze</button>
-        </div>
       </div>
-    </section>
-
-    <!-- Step 3: Export -->
-    <section id="export-section" class="card">
-      <h2>3. Export Database</h2>
-      <div id="saved-surahs-summary"></div>
-      <div class="settings-grid">
-        <div class="setting">
-          <label for="db-name">Database Name</label>
-          <input type="text" id="db-name" value="gapless_timing">
-        </div>
-      </div>
-      <div class="actions">
-        <button class="btn btn-primary" onclick="exportDb()">Export .db.zip</button>
-        <button class="btn" id="btn-download" onclick="downloadExport()" disabled>Download</button>
-        <button class="btn btn-danger-outline" onclick="clearAllLocal()">Clear All Saved</button>
-      </div>
-      <div id="export-status" class="hidden"></div>
     </section>
   </main>
 
   <footer>
-    <p>Ayah Splitter - Compatible with <a href="https://github.com/quran/quran_android">quran_android</a></p>
+    <p>Made for <a href="https://github.com/quran/quran_android">quran_android</a></p>
   </footer>
 
   <script src="/static/app.js"></script>

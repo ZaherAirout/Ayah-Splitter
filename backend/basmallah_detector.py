@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy-loaded model
 _model = None
-_model_size = os.environ.get("WHISPER_MODEL", "small")
+_model_size = os.environ.get("WHISPER_MODEL", "large-v3")
 
 
 def _get_model():

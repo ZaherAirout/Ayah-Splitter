@@ -7,7 +7,7 @@ import traceback
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 
-from audio_analyzer import analyze_surah, get_waveform_data, load_audio
+from audio_analyzer import analyze_surah, get_waveform_data, load_audio, reflow_timings_from_anchor
 from db_export import create_timing_database, export_as_zip
 from quran_metadata import AYAH_COUNTS, SURAH_NAMES, NO_BASMALLAH
 from quran_text import get_surah_text, has_text
@@ -176,6 +176,37 @@ def waveform(surah_number):
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/reflow/<int:surah_number>", methods=["POST"])
+def reflow_timings(surah_number):
+    """Reflow later ayah timings after a manual marker move."""
+    if surah_number < 1 or surah_number > 114:
+        return jsonify({"error": "Invalid surah number"}), 400
+
+    data = request.get_json(silent=True) or {}
+    timings = data.get("timings")
+    silences = data.get("silences")
+    anchor_ayah = data.get("anchor_ayah")
+    next_fixed_ayah = data.get("next_fixed_ayah", 999)
+
+    if not isinstance(timings, list) or not isinstance(silences, list):
+        return jsonify({"error": "timings and silences are required"}), 400
+    if anchor_ayah is None:
+        return jsonify({"error": "anchor_ayah is required"}), 400
+
+    try:
+        result = reflow_timings_from_anchor(
+            surah_number,
+            timings,
+            silences,
+            int(anchor_ayah),
+            int(next_fixed_ayah),
+        )
+        session_timings[surah_number] = result
+        return jsonify({"success": True, "timings": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/api/timings/<int:surah_number>", methods=["GET"])

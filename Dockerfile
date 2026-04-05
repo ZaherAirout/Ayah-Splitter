@@ -21,9 +21,10 @@ RUN mkdir -p /data/uploads /data/output
 ENV UPLOAD_DIR=/data/uploads
 ENV OUTPUT_DIR=/data/output
 ENV PORT=8080
+ENV WHISPER_MODEL=large-v3
 
 EXPOSE 8080
 
 WORKDIR /app/backend
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "900", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--timeout", "900", "app:app"]
