@@ -1,13 +1,16 @@
 FROM python:3.12-slim
 
-# Install ffmpeg (required by pydub for MP3 processing)
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install PyTorch CPU-only first (avoids pulling large CUDA packages)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining Python dependencies
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -21,7 +24,8 @@ RUN mkdir -p /data/uploads /data/output
 ENV UPLOAD_DIR=/data/uploads
 ENV OUTPUT_DIR=/data/output
 ENV PORT=8080
-ENV WHISPER_MODEL=large-v3
+# HuggingFace model cache location (mounted as a volume for persistence)
+ENV HF_HOME=/root/.cache/huggingface
 
 EXPOSE 8080
 

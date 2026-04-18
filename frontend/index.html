@@ -80,6 +80,12 @@
       </div>
 
       <div id="editor-content" class="hidden">
+        <div class="tab-bar">
+          <button class="tab-btn tab-active" data-tab="editor" onclick="switchTab('editor')">Editor</button>
+          <button class="tab-btn" data-tab="debug" onclick="switchTab('debug')">Debug</button>
+        </div>
+
+        <div id="editor-tab-panel">
         <div class="workspace-hero">
           <div>
             <h2 id="editor-surah-name"></h2>
@@ -183,6 +189,59 @@
             <tbody id="timing-tbody"></tbody>
           </table>
         </div>
+        </div><!-- end #editor-tab-panel -->
+
+        <div id="debug-tab-panel" class="hidden debug-panel">
+          <div id="debug-empty" class="debug-empty">
+            <p>Run <strong>Analyze</strong> to see step-by-step debug information.</p>
+          </div>
+
+          <div id="debug-steps" class="hidden">
+
+            <div class="debug-section">
+              <div class="debug-section-header">
+                <span class="debug-step-num">1</span>
+                <h3>Audio Loading</h3>
+              </div>
+              <div class="debug-kv-row" id="dbg-audio"></div>
+            </div>
+
+            <div class="debug-section">
+              <div class="debug-section-header">
+                <span class="debug-step-num">2</span>
+                <h3>Silence Detection</h3>
+              </div>
+              <div id="dbg-silences"></div>
+            </div>
+
+            <div class="debug-section">
+              <div class="debug-section-header">
+                <span class="debug-step-num">3</span>
+                <h3>Whisper Transcription</h3>
+                <span class="debug-model-tag" id="dbg-model-tag">tarteel-ai/whisper-base-ar-quran</span>
+              </div>
+              <div id="dbg-whisper"></div>
+            </div>
+
+            <div class="debug-section">
+              <div class="debug-section-header">
+                <span class="debug-step-num">4</span>
+                <h3>Reference Alignment</h3>
+              </div>
+              <div id="dbg-alignment"></div>
+            </div>
+
+            <div class="debug-section">
+              <div class="debug-section-header">
+                <span class="debug-step-num">5</span>
+                <h3>Ayah Boundary Snapping</h3>
+              </div>
+              <div id="dbg-boundaries"></div>
+            </div>
+
+          </div>
+        </div><!-- end #debug-tab-panel -->
+
       </div>
     </section>
   </main>

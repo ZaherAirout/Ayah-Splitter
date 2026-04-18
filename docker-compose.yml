@@ -6,13 +6,12 @@ services:
     volumes:
       - ./audio_input:/data/uploads
       - ./output:/data/output
-      # Cache Whisper model so it persists across restarts
-      - whisper_cache:/root/.cache
+      # Cache HuggingFace model (tarteel-ai/whisper-base-ar-quran) across restarts
+      - hf_model_cache:/root/.cache/huggingface
     environment:
       - FLASK_DEBUG=0
       - PORT=8080
-      - WHISPER_MODEL=large-v3
     restart: unless-stopped
 
 volumes:
-  whisper_cache:
+  hf_model_cache:

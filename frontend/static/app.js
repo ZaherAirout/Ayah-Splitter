@@ -356,6 +356,8 @@ async function loadSurah(surahNum) {
   currentSurah = surahNum;
   currentTimings = []; currentSilences = []; currentAyahText = {};
   manualAnchorAyahs = new Set();
+  renderDebugPanel(null, null);
+  switchTab('editor');
   waveformCache = new Map();
   clearTimeout(waveformDetailTimer);
   waveformFetchRequestId += 1;
@@ -448,6 +450,7 @@ async function analyzeCurrent() {
     const d = await res.json();
     currentTimings = d.timings; currentSilences = d.silences || []; currentAyahText = d.ayah_text || {};
     manualAnchorAyahs = new Set();
+    if (d.debug) renderDebugPanel(d.debug, d);
 
     if (d.basmallah_detected != null) {
       showToast(d.basmallah_detected ? 'Basmallah detected' : 'No Basmallah detected', d.basmallah_detected ? 'success' : 'info');
@@ -987,3 +990,183 @@ function downloadExport() { window.open(`${API}/api/export/download?db_name=${do
 // ── Utilities ───────────────────────────────────────────────────────
 function formatTime(ms) { const m = Math.floor(ms/60000), s = Math.floor((ms%60000)/1000), r = Math.floor(ms%1000); return `${m}:${s.toString().padStart(2,'0')}.${r.toString().padStart(3,'0')}`; }
 function showToast(msg, type='info') { const t = document.createElement('div'); t.className = `toast ${type}`; t.textContent = msg; document.body.appendChild(t); setTimeout(()=>t.remove(), 3500); }
+
+// ── Debug Tab ────────────────────────────────────────────────────────
+let lastDebugInfo = null;
+
+function dbgTime(ms) {
+  if (ms == null) return '—';
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const r = ms % 1000;
+  return `${m}:${String(s).padStart(2,'0')}.${String(r).padStart(3,'0')}`;
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(btn =>
+    btn.classList.toggle('tab-active', btn.dataset.tab === tab)
+  );
+  document.getElementById('editor-tab-panel').classList.toggle('hidden', tab !== 'editor');
+  document.getElementById('debug-tab-panel').classList.toggle('hidden', tab !== 'debug');
+  if (tab === 'editor') renderWaveform();
+}
+
+function renderDebugPanel(debugInfo, d) {
+  lastDebugInfo = debugInfo;
+  const steps = document.getElementById('debug-steps');
+  const empty = document.getElementById('debug-empty');
+  if (!debugInfo || !d) {
+    steps.classList.add('hidden');
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+  steps.classList.remove('hidden');
+  const tag = document.getElementById('dbg-model-tag');
+  if (tag && debugInfo.model_name) tag.textContent = debugInfo.model_name;
+  renderDbgAudio(d, debugInfo);
+  renderDbgSilences(d, debugInfo);
+  renderDbgWhisper(d, debugInfo);
+  renderDbgAlignment(d, debugInfo);
+  renderDbgBoundaries(d, debugInfo);
+}
+
+function renderDbgAudio(d, dbg) {
+  document.getElementById('dbg-audio').innerHTML = `
+    <div class="dbg-kv">
+      <span class="dbg-key">Duration</span>
+      <span class="dbg-val">${dbgTime(d.duration_ms)} <span class="dbg-dim">(${d.duration_ms.toLocaleString()} ms)</span></span>
+    </div>
+    <div class="dbg-kv">
+      <span class="dbg-key">dBFS</span>
+      <span class="dbg-val">${dbg.audio_dbfs} dB</span>
+    </div>
+    <div class="dbg-kv">
+      <span class="dbg-key">Ayahs</span>
+      <span class="dbg-val">${d.num_ayahs}</span>
+    </div>
+    <div class="dbg-kv">
+      <span class="dbg-key">Surah</span>
+      <span class="dbg-val">${d.surah_name}</span>
+    </div>`;
+}
+
+function renderDbgSilences(d, dbg) {
+  const silences = d.silences || [];
+  const raw = dbg.raw_silence_count ?? silences.length;
+  const merged = dbg.merged_silence_count ?? silences.length;
+  const rows = silences.slice(0, 120).map((s, i) => {
+    const [st, en] = s;
+    return `<tr><td>${i+1}</td><td>${dbgTime(st)}</td><td>${dbgTime(en)}</td><td>${(en-st).toLocaleString()} ms</td></tr>`;
+  }).join('');
+  document.getElementById('dbg-silences').innerHTML = `
+    <div class="dbg-kv-row">
+      <div class="dbg-kv"><span class="dbg-key">Detected (raw)</span><span class="dbg-val">${raw}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">After merge</span><span class="dbg-val">${merged}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">Removed</span><span class="dbg-val">${raw - merged}</span></div>
+    </div>
+    <div class="dbg-table-wrap">
+      <table class="dbg-table">
+        <thead><tr><th>#</th><th>Start</th><th>End</th><th>Duration</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${silences.length > 120 ? `<p class="dbg-note">Showing first 120 of ${silences.length}</p>` : ''}
+    </div>`;
+}
+
+function renderDbgWhisper(d, dbg) {
+  const words = dbg.whisper_words || [];
+  const fullText = words.map(w => w.word).join(' ').trim();
+  const rows = words.slice(0, 300).map((w, i) =>
+    `<tr><td>${i+1}</td><td class="dbg-arabic-cell" dir="rtl">${esc(w.word)}</td><td>${dbgTime(w.start_ms)}</td><td>${dbgTime(w.end_ms)}</td><td>${(w.end_ms - w.start_ms)} ms</td></tr>`
+  ).join('');
+  document.getElementById('dbg-whisper').innerHTML = `
+    <div class="dbg-kv-row">
+      <div class="dbg-kv"><span class="dbg-key">Words</span><span class="dbg-val">${words.length}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">Ref size</span><span class="dbg-val">${dbg.ref_size ?? '—'}</span></div>
+    </div>
+    <div class="dbg-transcription">
+      <span class="dbg-key">Full transcription</span>
+      ${fullText
+        ? `<p class="dbg-arabic" dir="rtl">${esc(fullText)}</p>`
+        : `<p class="dbg-dim">No words transcribed</p>`}
+    </div>
+    <div class="dbg-table-wrap">
+      <table class="dbg-table">
+        <thead><tr><th>#</th><th>Word</th><th>Start</th><th>End</th><th>Duration</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${words.length > 300 ? `<p class="dbg-note">Showing first 300 of ${words.length}</p>` : ''}
+    </div>`;
+}
+
+function renderDbgAlignment(d, dbg) {
+  const rows = dbg.alignment_rows || [];
+  const quality = dbg.alignment_quality != null ? (dbg.alignment_quality * 100).toFixed(1) + '%' : '—';
+  const matched = dbg.matched_ref ?? 0;
+  const refSize = dbg.ref_size ?? 0;
+  const hypSize = dbg.hyp_size ?? 0;
+  const qualNum = (dbg.alignment_quality ?? 0);
+  const qualCls = qualNum >= 0.8 ? 'dbg-badge-yes' : qualNum >= 0.5 ? 'dbg-badge-warn' : 'dbg-badge-no';
+
+  const trs = rows.slice(0, 200).map(r =>
+    `<tr>
+      <td>${r.ref_ayah === 0 ? 'bsm' : r.ref_ayah}</td>
+      <td class="dbg-arabic-cell" dir="rtl">${esc(r.ref_word)}</td>
+      <td class="dbg-arabic-cell" dir="rtl">${esc(r.hyp_word)}</td>
+      <td>${dbgTime(r.start_ms)}</td>
+      <td>${dbgTime(r.end_ms)}</td>
+     </tr>`
+  ).join('');
+
+  document.getElementById('dbg-alignment').innerHTML = `
+    <div class="dbg-kv-row">
+      <div class="dbg-kv"><span class="dbg-key">Alignment quality</span><span class="dbg-badge ${qualCls}">${quality}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">Matched</span><span class="dbg-val">${matched} / ${refSize}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">Hypothesis words</span><span class="dbg-val">${hypSize}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">Missed</span><span class="dbg-val">${refSize - matched}</span></div>
+    </div>
+    <div class="dbg-table-wrap">
+      <table class="dbg-table">
+        <thead><tr><th>Ayah</th><th>Reference</th><th>Whisper</th><th>Start</th><th>End</th></tr></thead>
+        <tbody>${trs}</tbody>
+      </table>
+      ${rows.length > 200 ? `<p class="dbg-note">Showing first 200 matched pairs of ${rows.length}</p>` : ''}
+    </div>`;
+}
+
+function renderDbgBoundaries(d, dbg) {
+  const snap = dbg.snap_debug || [];
+  const raw = dbg.ayah_raw_starts || {};
+  const snapRange = dbg.boundary_search_range_ms;
+  const effStart = dbg.effective_start_ms ?? 0;
+  const effEnd = dbg.effective_end_ms ?? d.duration_ms;
+
+  const rows = snap.map(r => {
+    const ayah = r.ayah;
+    const rawT = r.raw;
+    const snapped = r.snapped;
+    const dist = r.snap_dist;
+    const snappedFlag = r.silence_idx != null;
+    return `<tr>
+      <td>${ayah === 0 ? 'bsm' : ayah}</td>
+      <td>${dbgTime(rawT)}</td>
+      <td>${dbgTime(snapped)}</td>
+      <td class="w-r ${dist > 500 ? 'drift-hi' : ''}">${dist.toLocaleString()} ms</td>
+      <td>${snappedFlag ? `#${r.silence_idx}` : '<span class="dbg-dim">—</span>'}</td>
+     </tr>`;
+  }).join('');
+
+  document.getElementById('dbg-boundaries').innerHTML = `
+    <div class="dbg-kv-row">
+      <div class="dbg-kv"><span class="dbg-key">Content start</span><span class="dbg-val">${dbgTime(effStart)}</span></div>
+      <div class="dbg-kv"><span class="dbg-key">Content end</span><span class="dbg-val">${dbgTime(effEnd)}</span></div>
+      ${snapRange != null ? `<div class="dbg-kv"><span class="dbg-key">Snap range</span><span class="dbg-val">±${snapRange.toLocaleString()} ms</span></div>` : ''}
+    </div>
+    <div class="dbg-table-wrap">
+      <table class="dbg-table">
+        <thead><tr><th>Ayah</th><th>Whisper time</th><th>Snapped time</th><th>Drift</th><th>Silence</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}

@@ -150,6 +150,7 @@ def analyze(surah_number):
             "basmallah_transcription": result.get("basmallah_transcription"),
             "basmallah_method": result.get("basmallah_method"),
             "basmallah_confidence": result.get("basmallah_confidence"),
+            "debug": result.get("debug"),
         })
     except Exception as e:
         traceback.print_exc()

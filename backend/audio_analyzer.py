@@ -67,8 +67,8 @@ def _merge_close_silences(
     return [(start, end) for start, end in merged]
 
 
-def _detect_silences(audio: AudioSegment, num_ayahs: int) -> list[tuple[int, int]]:
-    """Auto-detect silences scaled for audio duration and ayah count."""
+def _detect_silences(audio: AudioSegment, num_ayahs: int) -> tuple[list, list]:
+    """Returns (raw_silences, merged_silences). Auto-detects using scaled thresholds."""
     duration_ms = len(audio)
     audio_dbfs = audio.dBFS
 
@@ -110,7 +110,8 @@ def _detect_silences(audio: AudioSegment, num_ayahs: int) -> list[tuple[int, int
             audio, min_silence_len=80, silence_thresh=audio_dbfs - 5, seek_step=seek_step
         )
 
-    return _merge_close_silences(audio, best_silences)
+    merged = _merge_close_silences(audio, best_silences)
+    return best_silences, merged
 
 
 def _count_ayah_words(text: str) -> int:
@@ -276,7 +277,7 @@ def estimate_ayah_splits(
     basmallah_info: dict | None = None,
     trim_start_ms: int = 0,
     trim_end_ms: int = 0,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     """
     Estimate ayah splitting points.
 
@@ -315,6 +316,7 @@ def estimate_ayah_splits(
     boundary_search_range_ms = _get_boundary_search_range(
         effective_start, effective_end, num_ayahs
     )
+    _dbg_estimates: list[int] = []
 
     if surah_number == 1:
         # Al-Fatiha: Basmallah IS ayah 1
@@ -325,6 +327,7 @@ def estimate_ayah_splits(
         snapped = _snap_to_silences(
             estimates, eff_silences, search_range_ms=boundary_search_range_ms
         )
+        _dbg_estimates = estimates
         # Enforce: each split > previous
         prev = effective_start
         for i, t in enumerate(snapped):
@@ -341,6 +344,7 @@ def estimate_ayah_splits(
         snapped = _snap_to_silences(
             estimates, eff_silences, search_range_ms=boundary_search_range_ms
         )
+        _dbg_estimates = estimates
         prev = effective_start
         for i, t in enumerate(snapped):
             t = max(t, prev + 100)
@@ -372,6 +376,7 @@ def estimate_ayah_splits(
         snapped = _snap_to_silences(
             estimates, remaining_silences, search_range_ms=boundary_search_range_ms
         )
+        _dbg_estimates = estimates
         prev = ayah1_start
         for i, t in enumerate(snapped):
             t = max(t, prev + 100)
@@ -387,6 +392,7 @@ def estimate_ayah_splits(
         snapped = _snap_to_silences(
             estimates, eff_silences, search_range_ms=boundary_search_range_ms
         )
+        _dbg_estimates = estimates
         prev = effective_start
         for i, t in enumerate(snapped):
             t = max(t, prev + 100)
@@ -398,7 +404,14 @@ def estimate_ayah_splits(
     # Final validation: ensure strict ordering
     _enforce_ordering(timings)
 
-    return timings
+    _debug = {
+        "weights": weights,
+        "effective_start_ms": effective_start,
+        "effective_end_ms": effective_end,
+        "boundary_search_range_ms": boundary_search_range_ms,
+        "estimated_positions": _dbg_estimates,
+    }
+    return timings, _debug
 
 
 def _enforce_ordering(timings: list[dict]):
@@ -483,6 +496,31 @@ def reflow_timings_from_anchor(
     return result
 
 
+def _snap_boundary_to_silence(
+    t_ms: int,
+    silences: list[tuple[int, int]],
+    max_dist_ms: int = 800,
+) -> tuple[int, int | None]:
+    """Snap a boundary to the nearest silence midpoint within max_dist_ms.
+
+    Returns (snapped_time_ms, silence_index_or_None).
+    """
+    best = None
+    best_dist = max_dist_ms + 1
+    for i, (s, e) in enumerate(silences):
+        mid = (s + e) // 2
+        dist = abs(mid - t_ms)
+        duration = max(1, e - s)
+        # Prefer closer silences, with a small bonus for longer gaps
+        score = dist - min(duration, 400) * 0.25
+        if dist <= max_dist_ms and score < best_dist:
+            best_dist = score
+            best = (mid, i)
+    if best is None:
+        return t_ms, None
+    return best[0], best[1]
+
+
 def analyze_surah(
     filepath: str,
     surah_number: int,
@@ -490,78 +528,126 @@ def analyze_surah(
     trim_end_ms: int = 0,
     basmallah_mode: str = "auto",
     manual_basmallah_end_ms: int | None = None,
+    progress_cb=None,
     **kwargs,
 ) -> dict:
     """
     Full analysis pipeline:
     1. Load audio
-    2. Detect silences (auto-tuned thresholds)
-    3. Detect Basmallah with Whisper (first 15s)
-    4. Estimate splits using word-count weighting + silence snapping
-    5. Enforce ordering constraints
+    2. Detect silences (for boundary snapping)
+    3. Transcribe full audio with tarteel-ai/whisper-base-ar-quran
+       (word-level timestamps)
+    4. Align whisper words to canonical Quran text
+    5. Derive per-ayah start times from alignment
+    6. Snap each boundary to the nearest silence for acoustic precision
     """
+    from whisper_quran import transcribe_words, MODEL_NAME
+    from ayah_aligner import compute_boundaries
+
+    def _progress(pct: int, msg: str):
+        if progress_cb:
+            progress_cb(pct, msg)
+
+    _progress(5, "Loading audio")
     audio = load_audio(filepath)
     duration_ms = len(audio)
     num_ayahs = AYAH_COUNTS[surah_number]
-    effective_end_ms = max(trim_start_ms, duration_ms - trim_end_ms)
+    effective_start = trim_start_ms
+    effective_end = max(trim_start_ms, duration_ms - trim_end_ms)
 
-    if manual_basmallah_end_ms is not None:
-        manual_basmallah_end_ms = max(
-            trim_start_ms,
-            min(manual_basmallah_end_ms, max(trim_start_ms, effective_end_ms - 100)),
-        )
+    _progress(15, "Detecting silences")
+    raw_silences, silences = _detect_silences(audio, num_ayahs=num_ayahs)
 
-    silences = _detect_silences(audio, num_ayahs=num_ayahs)
-
-    # Basmallah detection (skip for surah 9)
-    basmallah_info = None
-    if surah_number not in NO_BASMALLAH:
-        try:
-            from basmallah_detector import detect_basmallah
-
-            if basmallah_mode == "absent":
-                basmallah_info = {
-                    "has_basmallah": False,
-                    "transcription": "",
-                    "basmallah_end_ms": None,
-                    "confidence": 1.0,
-                    "method": "manual-absent",
-                }
-            else:
-                detected = detect_basmallah(audio, surah_number=surah_number)
-                if basmallah_mode == "present":
-                    boundary = manual_basmallah_end_ms
-                    if boundary is None:
-                        boundary = detected.get("basmallah_end_ms") or _find_opening_boundary_candidate(
-                            silences, trim_start_ms, effective_end_ms
-                        )
-
-                    basmallah_info = {
-                        "has_basmallah": True,
-                        "transcription": detected.get("transcription", ""),
-                        "basmallah_end_ms": boundary,
-                        "confidence": 1.0 if manual_basmallah_end_ms is not None else max(
-                            detected.get("confidence", 0.0),
-                            0.55 if boundary is not None else 0.4,
-                        ),
-                        "method": "manual" if manual_basmallah_end_ms is not None else "manual-present",
-                    }
-                else:
-                    basmallah_info = detected
-
-            logger.info(
-                f"Surah {surah_number}: bsm={'YES' if basmallah_info['has_basmallah'] else 'NO'}"
-                f" end={basmallah_info.get('basmallah_end_ms')}ms"
-                f" method={basmallah_info.get('method')}"
-                f" mode={basmallah_mode}"
-            )
-        except Exception as e:
-            logger.warning(f"Basmallah detection failed for surah {surah_number}: {e}")
-
-    timings = estimate_ayah_splits(
-        surah_number, duration_ms, silences, basmallah_info,
-        trim_start_ms=trim_start_ms, trim_end_ms=trim_end_ms,
+    # Limit transcription to the trimmed audio window for speed & accuracy.
+    audio_clip = audio[effective_start:effective_end]
+    logger.info(
+        f"Surah {surah_number}: transcribing {len(audio_clip)/1000:.1f}s with {MODEL_NAME}"
     )
+    _progress(25, "Transcribing audio with Whisper…")
+    hypothesis = transcribe_words(audio_clip)
+    _progress(75, "Aligning to reference text")
+    # Shift timestamps back to absolute positions
+    for w in hypothesis:
+        w["start_ms"] = int(w["start_ms"]) + effective_start
+        w["end_ms"] = int(w["end_ms"]) + effective_start
+
+    weights = _get_ayah_weights(surah_number)
+    alignment_result = compute_boundaries(
+        surah_number,
+        hypothesis,
+        content_start_ms=effective_start,
+        content_end_ms=effective_end,
+        weights=weights,
+    )
+
+    ayah_starts = alignment_result["ayah_starts"]
+    include_bsm = alignment_result["include_basmallah"]
+
+    # Manual override for basmallah mode
+    if basmallah_mode == "absent":
+        include_bsm = False
+        ayah_starts.pop(0, None)
+        if surah_number == 1:
+            # Fatiha: basmallah IS ayah 1, user can't "remove" it
+            include_bsm = False
+    elif basmallah_mode == "present" and surah_number not in NO_BASMALLAH and surah_number != 1:
+        include_bsm = True
+        if manual_basmallah_end_ms is not None:
+            ayah_starts[0] = effective_start
+            ayah_starts[1] = int(manual_basmallah_end_ms)
+
+    # Snap each boundary to nearest silence for acoustic precision
+    snapped_starts: dict[int, int] = {}
+    snap_debug: list[dict] = []
+    boundary_range_ms = _get_boundary_search_range(
+        effective_start, effective_end, num_ayahs
+    )
+    snap_range = min(800, max(250, boundary_range_ms // 2))
+
+    _progress(85, "Snapping boundaries to silences")
+    for ayah, t in ayah_starts.items():
+        # Never snap ayah-0 start (always at content_start) or ayah-1-start for Fatiha
+        if ayah == 0 or (ayah == 1 and (surah_number == 1 or not include_bsm)):
+            snapped_starts[ayah] = effective_start
+            snap_debug.append({"ayah": ayah, "raw": t, "snapped": effective_start, "snap_dist": 0})
+            continue
+        snapped, idx = _snap_boundary_to_silence(t, silences, max_dist_ms=snap_range)
+        snapped_starts[ayah] = snapped
+        snap_debug.append({
+            "ayah": ayah,
+            "raw": t,
+            "snapped": snapped,
+            "snap_dist": abs(snapped - t),
+            "silence_idx": idx,
+        })
+
+    # Build timings list (ayah 0, 1, 2, ..., N, 999)
+    timings: list[dict] = []
+    timings.append({"ayah": 0, "time": effective_start})
+
+    if include_bsm:
+        # ayah 1 starts after basmallah
+        timings.append({"ayah": 1, "time": snapped_starts.get(1, effective_start)})
+    else:
+        timings.append({"ayah": 1, "time": effective_start})
+
+    prev = timings[-1]["time"]
+    for ayah in range(2, num_ayahs + 1):
+        t = snapped_starts.get(ayah, prev + 100)
+        t = max(t, prev + 100)
+        timings.append({"ayah": ayah, "time": t})
+        prev = t
+
+    timings.append({"ayah": 999, "time": effective_end})
+    _enforce_ordering(timings)
+
+    basmallah_transcription = ""
+    if include_bsm:
+        basmallah_words = [
+            h for h in hypothesis
+            if h["end_ms"] <= snapped_starts.get(1, effective_end) + 100
+        ]
+        basmallah_transcription = " ".join(w["word"] for w in basmallah_words[:12])
 
     return {
         "surah": surah_number,
@@ -569,10 +655,29 @@ def analyze_surah(
         "silences": silences,
         "timings": timings,
         "num_ayahs": num_ayahs,
-        "basmallah_detected": basmallah_info["has_basmallah"] if basmallah_info else None,
-        "basmallah_transcription": basmallah_info.get("transcription") if basmallah_info else None,
-        "basmallah_method": basmallah_info.get("method") if basmallah_info else None,
-        "basmallah_confidence": basmallah_info.get("confidence") if basmallah_info else None,
+        "basmallah_detected": include_bsm if surah_number not in NO_BASMALLAH and surah_number != 1 else None,
+        "basmallah_transcription": basmallah_transcription,
+        "basmallah_method": "whisper-aligned",
+        "basmallah_confidence": alignment_result["alignment_quality"],
+        "debug": {
+            "audio_dbfs": round(_safe_dbfs(audio), 2),
+            "raw_silence_count": len(raw_silences),
+            "merged_silence_count": len(silences),
+            "weights": weights,
+            "effective_start_ms": effective_start,
+            "effective_end_ms": effective_end,
+            "boundary_search_range_ms": snap_range,
+            "model_name": MODEL_NAME,
+            "whisper_words": hypothesis,
+            "alignment_quality": alignment_result["alignment_quality"],
+            "matched_ref": alignment_result["matched_ref"],
+            "ref_size": alignment_result["ref_size"],
+            "hyp_size": alignment_result["hyp_size"],
+            "ayah_raw_starts": ayah_starts,
+            "ayah_snapped_starts": snapped_starts,
+            "snap_debug": snap_debug,
+            "alignment_rows": alignment_result["alignment_debug"][:500],
+        },
     }
 
 
