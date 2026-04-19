@@ -30,6 +30,11 @@ session_uploads: set[int] = set()  # Track which surahs were uploaded this sessi
 analyze_jobs: dict[str, dict] = {}
 analyze_jobs_lock = threading.Lock()
 ANALYZE_JOB_TTL = timedelta(hours=6)
+MAX_ANALYZE_EVENTS = 120
+
+
+class AnalysisCanceledError(Exception):
+    """Raised when a background analysis job is canceled by the user."""
 
 
 @app.route("/")
@@ -144,13 +149,46 @@ def _prune_analyze_jobs():
         analyze_jobs.pop(job_id, None)
 
 
+def _append_analyze_job_event(job: dict, message: str | None = None):
+    event = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "status": job.get("status"),
+        "progress": int(job.get("progress", 0) or 0),
+        "message": message if message is not None else job.get("message", ""),
+    }
+    events = job.setdefault("events", [])
+    if events:
+        last = events[-1]
+        if (
+            last.get("status") == event["status"]
+            and last.get("progress") == event["progress"]
+            and last.get("message") == event["message"]
+        ):
+            return
+    events.append(event)
+    if len(events) > MAX_ANALYZE_EVENTS:
+        del events[:-MAX_ANALYZE_EVENTS]
+
+
 def _update_analyze_job(job_id: str, **updates):
     with analyze_jobs_lock:
         job = analyze_jobs.get(job_id)
         if not job:
             return
+        before = (
+            job.get("status"),
+            job.get("progress", 0),
+            job.get("message", ""),
+        )
         job.update(updates)
         job["updated_at"] = datetime.now(timezone.utc)
+        after = (
+            job.get("status"),
+            job.get("progress", 0),
+            job.get("message", ""),
+        )
+        if after != before:
+            _append_analyze_job_event(job)
 
 
 def _run_analyze_job(
@@ -162,10 +200,21 @@ def _run_analyze_job(
     basmallah_mode: str,
     manual_basmallah_end_ms: int | None,
 ):
+    cancel_event = None
+    with analyze_jobs_lock:
+        job = analyze_jobs.get(job_id)
+        if job:
+            cancel_event = job.get("cancel_event")
+
     try:
+        if cancel_event and cancel_event.is_set():
+            raise AnalysisCanceledError()
+
         _update_analyze_job(job_id, status="running", progress=1, message="Queued")
 
         def progress_cb(progress: int, message: str):
+            if cancel_event and cancel_event.is_set():
+                raise AnalysisCanceledError()
             _update_analyze_job(
                 job_id,
                 status="running",
@@ -182,6 +231,8 @@ def _run_analyze_job(
             manual_basmallah_end_ms=manual_basmallah_end_ms,
             progress_cb=progress_cb,
         )
+        if cancel_event and cancel_event.is_set():
+            raise AnalysisCanceledError()
         session_timings[surah_number] = result["timings"]
         payload = _build_analysis_response(surah_number, result)
         _update_analyze_job(
@@ -190,6 +241,12 @@ def _run_analyze_job(
             progress=100,
             message="Done",
             result=payload,
+        )
+    except AnalysisCanceledError:
+        _update_analyze_job(
+            job_id,
+            status="canceled",
+            message="Analysis canceled",
         )
     except Exception as exc:
         traceback.print_exc()
@@ -232,7 +289,10 @@ def start_analyze_job(surah_number):
             "message": "Queued",
             "created_at": now,
             "updated_at": now,
+            "cancel_event": threading.Event(),
+            "events": [],
         }
+        _append_analyze_job_event(analyze_jobs[job_id], "Queued")
 
     thread = threading.Thread(
         target=_run_analyze_job,
@@ -266,12 +326,47 @@ def get_analyze_job(job_id: str):
             "status": job["status"],
             "progress": job.get("progress", 0),
             "message": job.get("message", ""),
+            "events": job.get("events", [])[-60:],
         }
         if job["status"] == "completed":
             payload["result"] = job.get("result")
         if job["status"] == "failed":
             payload["error"] = job.get("error", "Analysis failed")
         return jsonify(payload)
+
+
+@app.route("/api/analyze-jobs/<job_id>/cancel", methods=["POST"])
+def cancel_analyze_job(job_id: str):
+    """Request cancellation of an in-progress analysis job."""
+    with analyze_jobs_lock:
+        job = analyze_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Analyze job not found"}), 404
+
+        if job["status"] in {"completed", "failed", "canceled"}:
+            return jsonify({
+                "success": True,
+                "status": job["status"],
+                "message": job.get("message", ""),
+            })
+
+        cancel_event = job.get("cancel_event")
+        if cancel_event:
+            cancel_event.set()
+
+    _update_analyze_job(
+        job_id,
+        status="canceling",
+        message="Cancel requested",
+    )
+
+    with analyze_jobs_lock:
+        job = analyze_jobs.get(job_id) or {}
+        return jsonify({
+            "success": True,
+            "status": job.get("status", "canceling"),
+            "message": job.get("message", "Cancel requested"),
+        })
 
 
 @app.route("/api/analyze/<int:surah_number>", methods=["POST"])

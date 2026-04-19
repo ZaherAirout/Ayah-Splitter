@@ -23,6 +23,10 @@ let waveformFetchRequestId = 0;
 let waveformDetailTimer = null;
 let analyzeProgressTimer = null;
 let analyzeProgressValue = 0;
+let activeAnalyzeJobId = null;
+let activeAnalyzeSurah = null;
+let activeAnalyzeStatus = null;
+let lastAnalyzeJobSnapshot = null;
 
 const BASE_WAVEFORM_POINTS = 2000;
 const WAVEFORM_DETAIL_LEVELS = [2000, 4000, 8000, 12000, 16000];
@@ -338,9 +342,15 @@ function renderUploadedList() {
   document.getElementById('upload-count').textContent = `${uploadedFiles.length} files`;
   list.classList.remove('hidden');
   list.innerHTML = uploadedFiles.map(f => {
-    const cls = f.status === 'analyzing' ? 'analyzing' : f.status === 'analyzed' ? 'analyzed' : 'pending';
+    const cls = f.status === 'analyzing' || f.status === 'canceling'
+      ? f.status
+      : f.status === 'analyzed'
+        ? 'analyzed'
+        : 'pending';
     const progress = Number.isFinite(f.progress) ? Math.round(f.progress) : 0;
-    const txt = f.status === 'analyzing'
+    const txt = f.status === 'canceling'
+      ? '<span class="spinner"></span> Canceling'
+      : f.status === 'analyzing'
       ? `<span class="spinner"></span> ${progress}%`
       : f.status === 'analyzed'
         ? 'Ready'
@@ -368,22 +378,135 @@ function updateAnalyzeButton(progress, message = 'Analyzing') {
   }
 }
 
-function setAnalyzeProgress(progress, message = 'Analyzing') {
+function setAnalyzeProgress(progress, message = 'Analyzing', surahNum = currentSurah) {
   analyzeProgressValue = Math.max(0, Math.min(100, Math.round(progress)));
   updateAnalyzeButton(analyzeProgressValue, message);
-  if (currentSurah) setFileStatus(currentSurah, 'analyzing', analyzeProgressValue);
+  if (surahNum) setFileStatus(surahNum, 'analyzing', analyzeProgressValue);
 }
 
-function startAnalyzeProgress() {
+function startAnalyzeProgress(surahNum = currentSurah) {
   clearInterval(analyzeProgressTimer);
   analyzeProgressTimer = null;
-  setAnalyzeProgress(0, 'Queued');
+  setAnalyzeProgress(0, 'Queued', surahNum);
 }
 
 function stopAnalyzeProgress() {
   clearInterval(analyzeProgressTimer);
   analyzeProgressTimer = null;
   analyzeProgressValue = 0;
+}
+
+function getSurahName(surahNum) {
+  return surahs.find(s => s.number === surahNum)?.name || `Surah ${surahNum}`;
+}
+
+function showAnalyzeModal(surahNum) {
+  const modal = document.getElementById('analyze-modal');
+  modal.classList.remove('hidden');
+  document.getElementById('analyze-modal-title').textContent = `${surahNum}. ${getSurahName(surahNum)}`;
+}
+
+function closeAnalyzeModal(force = false) {
+  const isActive = activeAnalyzeJobId && !['completed', 'failed', 'canceled'].includes(activeAnalyzeStatus || '');
+  if (isActive && !force) return;
+  document.getElementById('analyze-modal').classList.add('hidden');
+}
+
+function onAnalyzeModalBackdrop(event) {
+  if (event.target === event.currentTarget) closeAnalyzeModal();
+}
+
+function formatAnalyzeEventTime(isoString) {
+  if (!isoString) return '--:--:--';
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return '--:--:--';
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
+
+function updateAnalyzeModal(job) {
+  if (!job) return;
+  lastAnalyzeJobSnapshot = job;
+  const surahNum = job.surah_number || activeAnalyzeSurah || currentSurah || 0;
+  if (surahNum) showAnalyzeModal(surahNum);
+
+  const percent = Math.max(0, Math.min(100, Math.round(job.progress || 0)));
+  const message = job.message || 'Analyzing';
+  const status = job.status || 'queued';
+  const statusLabel = status === 'canceling'
+    ? 'Canceling'
+    : status === 'completed'
+      ? 'Done'
+      : status === 'canceled'
+        ? 'Canceled'
+        : status.charAt(0).toUpperCase() + status.slice(1);
+
+  const statusEl = document.getElementById('analyze-modal-status');
+  statusEl.textContent = statusLabel;
+  statusEl.className = `modal-status-pill ${status}`;
+
+  document.getElementById('analyze-modal-percent').textContent = `${percent}%`;
+  document.getElementById('analyze-modal-message').textContent = message;
+  document.getElementById('analyze-modal-progress-bar').style.width = `${percent}%`;
+
+  const feed = document.getElementById('analyze-modal-feed');
+  const events = job.events || [];
+  if (!events.length) {
+    feed.innerHTML = '<div class="analyze-feed-empty">Waiting for updates…</div>';
+  } else {
+    feed.innerHTML = events.map(event => `
+      <div class="analyze-feed-item">
+        <div class="analyze-feed-meta">
+          <span>${formatAnalyzeEventTime(event.at)}</span>
+          <span class="analyze-feed-state">${esc(event.status || '')}</span>
+          <span class="analyze-feed-progress">${Math.round(event.progress || 0)}%</span>
+        </div>
+        <div class="analyze-feed-message">${esc(event.message || '')}</div>
+      </div>
+    `).join('');
+    feed.scrollTop = feed.scrollHeight;
+  }
+
+  const cancelBtn = document.getElementById('btn-cancel-analyze');
+  const closeBtn = document.getElementById('btn-close-analyze-modal');
+  const isTerminal = ['completed', 'failed', 'canceled'].includes(status);
+  cancelBtn.disabled = !activeAnalyzeJobId || isTerminal || status === 'canceling';
+  cancelBtn.textContent = status === 'canceling' ? 'Canceling…' : 'Cancel';
+  closeBtn.classList.toggle('hidden', !isTerminal);
+}
+
+async function cancelAnalyzeCurrent() {
+  if (!activeAnalyzeJobId) return;
+
+  const cancelBtn = document.getElementById('btn-cancel-analyze');
+  cancelBtn.disabled = true;
+  cancelBtn.textContent = 'Canceling…';
+
+  try {
+    const res = await fetch(`${API}/api/analyze-jobs/${activeAnalyzeJobId}/cancel`, { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Cancel failed');
+
+    activeAnalyzeStatus = data.status || 'canceling';
+    if (activeAnalyzeSurah) {
+      setFileStatus(activeAnalyzeSurah, 'canceling', analyzeProgressValue);
+    }
+    updateAnalyzeModal({
+      ...(lastAnalyzeJobSnapshot || {}),
+      surah_number: activeAnalyzeSurah,
+      status: data.status || 'canceling',
+      progress: analyzeProgressValue,
+      message: data.message || 'Cancel requested',
+    });
+  } catch (e) {
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = 'Cancel';
+    showToast('Cancel failed: ' + e.message, 'error');
+  }
 }
 
 function openUploadedSurah(surahNum) {
@@ -433,7 +556,13 @@ async function loadSurah(surahNum) {
   badge.textContent = ''; badge.className = 'basmallah-badge';
 
   zoomLevel = 1; document.getElementById('zoom-level').textContent = '100%';
-  document.getElementById('btn-analyze-surah').disabled = false;
+  document.getElementById('btn-analyze-surah').disabled = Boolean(activeAnalyzeJobId);
+  if (!activeAnalyzeJobId) {
+    document.getElementById('btn-analyze-surah').textContent = 'Analyze';
+    document.getElementById('btn-analyze-surah').title = 'Analyze';
+  } else {
+    updateAnalyzeButton(analyzeProgressValue, lastAnalyzeJobSnapshot?.message || 'Analyzing');
+  }
   document.getElementById('editor-content').classList.remove('hidden');
 
   // Show saved indicator
@@ -460,16 +589,32 @@ async function loadSurah(surahNum) {
 
 async function analyzeCurrent() {
   if (!currentSurah) return;
+  if (activeAnalyzeJobId) {
+    showAnalyzeModal(activeAnalyzeSurah || currentSurah);
+    return;
+  }
+
+  const analyzingSurah = currentSurah;
   const btn = document.getElementById('btn-analyze-surah');
   btn.disabled = true;
-  startAnalyzeProgress();
+  startAnalyzeProgress(analyzingSurah);
+  activeAnalyzeSurah = analyzingSurah;
+  activeAnalyzeStatus = 'queued';
+  lastAnalyzeJobSnapshot = {
+    surah_number: analyzingSurah,
+    status: 'queued',
+    progress: 0,
+    message: 'Queued',
+    events: [{ at: new Date().toISOString(), status: 'queued', progress: 0, message: 'Queued' }],
+  };
+  updateAnalyzeModal(lastAnalyzeJobSnapshot);
 
   const basmallahMode = document.getElementById('basmallah-mode').value || 'auto';
   const manualBasmallahValue = document.getElementById('manual-basmallah-end').value;
   const manualBasmallahEndMs = manualBasmallahValue === '' ? null : parseInt(manualBasmallahValue, 10);
 
   try {
-    const startRes = await fetch(`${API}/api/analyze-jobs/${currentSurah}`, {
+    const startRes = await fetch(`${API}/api/analyze-jobs/${analyzingSurah}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         trim_start_ms: trimStartMs,
@@ -488,65 +633,120 @@ async function analyzeCurrent() {
       stopAnalyzeProgress();
       const message = startData?.error || 'Analysis failed';
       showToast(message, 'error');
-      setFileStatus(currentSurah, 'uploaded');
+      setFileStatus(analyzingSurah, 'uploaded');
+      updateAnalyzeModal({
+        ...lastAnalyzeJobSnapshot,
+        status: 'failed',
+        message,
+        events: [...(lastAnalyzeJobSnapshot?.events || []), {
+          at: new Date().toISOString(),
+          status: 'failed',
+          progress: analyzeProgressValue,
+          message,
+        }],
+      });
       return;
     }
 
     const jobId = startData.job_id;
-    let d = null;
+    activeAnalyzeJobId = jobId;
+    let finalJob = null;
 
     while (true) {
-      await new Promise(resolve => setTimeout(resolve, 450));
       const jobRes = await fetch(`${API}/api/analyze-jobs/${jobId}`);
       const job = await jobRes.json();
       if (!jobRes.ok) throw new Error(job.error || 'Analysis failed');
 
-      setAnalyzeProgress(job.progress || 0, job.message || 'Analyzing');
+      activeAnalyzeStatus = job.status;
+      const progressMessage = job.message || 'Analyzing';
+      if (job.status === 'canceling') {
+        setFileStatus(analyzingSurah, 'canceling', job.progress || analyzeProgressValue);
+      } else {
+        setAnalyzeProgress(job.progress || 0, progressMessage, analyzingSurah);
+      }
+      updateAnalyzeModal(job);
 
       if (job.status === 'completed') {
-        d = job.result;
+        finalJob = job;
+        break;
+      }
+      if (job.status === 'canceled') {
+        finalJob = job;
         break;
       }
       if (job.status === 'failed') {
         throw new Error(job.error || 'Analysis failed');
       }
+
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
-    setAnalyzeProgress(100, 'Done');
-    currentTimings = d.timings; currentSilences = d.silences || []; currentAyahText = d.ayah_text || {};
-    manualAnchorAyahs = new Set();
-    if (d.debug) renderDebugPanel(d.debug, d);
-
-    if (d.basmallah_detected != null) {
-      showToast(d.basmallah_detected ? 'Basmallah detected' : 'No Basmallah detected', d.basmallah_detected ? 'success' : 'info');
+    if (finalJob.status === 'canceled') {
+      setFileStatus(analyzingSurah, 'uploaded');
+      showToast('Analysis canceled', 'info');
+      return;
     }
 
-    if (!Object.keys(currentAyahText).length) {
-      const tr = await fetch(`${API}/api/text/${currentSurah}`);
-      if (tr.ok) { const td = await tr.json(); if (td.available) currentAyahText = td.ayahs; }
-    }
+    const d = finalJob.result;
+    setAnalyzeProgress(100, 'Done', analyzingSurah);
+    updateAnalyzeModal(finalJob);
+    setFileStatus(analyzingSurah, 'analyzed');
 
-    const badge = document.getElementById('editor-basmallah');
-    if (d.basmallah_detected === true) {
-      badge.textContent = d.basmallah_method && d.basmallah_method.startsWith('manual')
-        ? 'Basmallah forced'
-        : 'Basmallah detected';
-      badge.className = 'basmallah-badge detected';
-    } else if (d.basmallah_detected === false) {
-      badge.textContent = d.basmallah_method === 'manual-absent'
-        ? 'No Basmallah (manual)'
-        : 'No Basmallah';
-      badge.className = 'basmallah-badge not-detected';
-    }
+    if (currentSurah === analyzingSurah) {
+      currentTimings = d.timings;
+      currentSilences = d.silences || [];
+      currentAyahText = d.ayah_text || {};
+      manualAnchorAyahs = new Set();
+      if (d.debug) renderDebugPanel(d.debug, d);
 
-    setFileStatus(currentSurah, 'analyzed');
-    renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays(); highlightActiveRow();
+      if (d.basmallah_detected != null) {
+        showToast(d.basmallah_detected ? 'Basmallah detected' : 'No Basmallah detected', d.basmallah_detected ? 'success' : 'info');
+      }
+
+      if (!Object.keys(currentAyahText).length) {
+        const tr = await fetch(`${API}/api/text/${analyzingSurah}`);
+        if (tr.ok) { const td = await tr.json(); if (td.available) currentAyahText = td.ayahs; }
+      }
+
+      const badge = document.getElementById('editor-basmallah');
+      if (d.basmallah_detected === true) {
+        badge.textContent = d.basmallah_method && d.basmallah_method.startsWith('manual')
+          ? 'Basmallah forced'
+          : 'Basmallah detected';
+        badge.className = 'basmallah-badge detected';
+      } else if (d.basmallah_detected === false) {
+        badge.textContent = d.basmallah_method === 'manual-absent'
+          ? 'No Basmallah (manual)'
+          : 'No Basmallah';
+        badge.className = 'basmallah-badge not-detected';
+      }
+
+      renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays(); highlightActiveRow();
+    } else {
+      showToast(`Surah ${analyzingSurah} analysis complete`, 'success');
+    }
   } catch (e) {
     stopAnalyzeProgress();
+    activeAnalyzeStatus = 'failed';
     showToast('Error: ' + e.message, 'error');
-    setFileStatus(currentSurah, 'uploaded');
+    setFileStatus(analyzingSurah, 'uploaded');
+    updateAnalyzeModal({
+      ...(lastAnalyzeJobSnapshot || {}),
+      surah_number: analyzingSurah,
+      status: 'failed',
+      progress: analyzeProgressValue,
+      message: e.message,
+      events: [...(lastAnalyzeJobSnapshot?.events || []), {
+        at: new Date().toISOString(),
+        status: 'failed',
+        progress: analyzeProgressValue,
+        message: e.message,
+      }],
+    });
   }
   finally {
+    activeAnalyzeJobId = null;
+    activeAnalyzeSurah = null;
     stopAnalyzeProgress();
     btn.disabled = false;
     btn.textContent = 'Analyze';
