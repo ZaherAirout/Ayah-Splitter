@@ -1,58 +1,48 @@
-"""Whisper Quran transcription with word-level timestamps.
+"""Quran transcription with word-level timestamps.
 
-Uses tarteel-ai/whisper-base-ar-quran (Quran-fine-tuned Whisper) through the
-HuggingFace Transformers ASR pipeline with `return_timestamps="word"`, sliding
-30 s windows with 5 s stride so it can handle full-surah audio.
+Uses the CTranslate2 conversion of Tarteel's Quran-tuned Whisper base model for
+much faster CPU inference while preserving the same underlying fine-tuned
+weights. Long files are processed in overlapping windows to keep memory bounded
+and to provide steady progress updates.
 """
 
 import logging
+import os
+
 import numpy as np
 from pydub import AudioSegment
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "tarteel-ai/whisper-base-ar-quran"
+MODEL_NAME = os.getenv("QURAN_WHISPER_MODEL", "OdyAsh/faster-whisper-base-ar-quran")
 _SAMPLE_RATE = 16000
-_CHUNK_LENGTH_S = 30
-_STRIDE_LENGTH_S = 5
+_SEGMENT_KEEP_MS = 180_000
+_SEGMENT_OVERLAP_MS = 5_000
+_DEVICE = os.getenv("QURAN_WHISPER_DEVICE", "cpu")
+_COMPUTE_TYPE = os.getenv("QURAN_WHISPER_COMPUTE_TYPE", "int8")
+_BEAM_SIZE = max(1, int(os.getenv("QURAN_WHISPER_BEAM_SIZE", "5")))
 
-_pipeline = None
+_model = None
 
 
-def _get_pipeline():
-    global _pipeline
-    if _pipeline is None:
-        import torch  # noqa: F401
-        from transformers import (
-            GenerationConfig,
-            WhisperForConditionalGeneration,
-            WhisperProcessor,
-            pipeline,
+def _get_model():
+    global _model
+    if _model is None:
+        from faster_whisper import WhisperModel
+
+        logger.info(
+            "Loading '%s' with faster-whisper (device=%s, compute_type=%s)...",
+            MODEL_NAME,
+            _DEVICE,
+            _COMPUTE_TYPE,
         )
-
-        logger.info(f"Loading '{MODEL_NAME}'...")
-        processor = WhisperProcessor.from_pretrained(MODEL_NAME)
-        model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
-
-        # Tarteel fine-tunes ship a trimmed generation_config missing timestamp
-        # token IDs — use the base Whisper generation config so that
-        # `return_timestamps="word"` works.
-        base = GenerationConfig.from_pretrained("openai/whisper-base")
-        logger.info(f"DBG base no_timestamps_token_id: {getattr(base, 'no_timestamps_token_id', 'MISS')}")
-        model.generation_config = base
-        logger.info(f"DBG model.generation_config no_timestamps_token_id: {getattr(model.generation_config, 'no_timestamps_token_id', 'MISS')}")
-
-        _pipeline = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            chunk_length_s=_CHUNK_LENGTH_S,
-            stride_length_s=_STRIDE_LENGTH_S,
-            return_timestamps="word",
+        _model = WhisperModel(
+            MODEL_NAME,
+            device=_DEVICE,
+            compute_type=_COMPUTE_TYPE,
         )
-        logger.info("ASR pipeline loaded.")
-    return _pipeline
+        logger.info("ASR model loaded.")
+    return _model
 
 
 def _audio_to_array(audio: AudioSegment) -> np.ndarray:
@@ -62,29 +52,79 @@ def _audio_to_array(audio: AudioSegment) -> np.ndarray:
     return samples / max_val
 
 
-def transcribe_words(audio: AudioSegment) -> list[dict]:
+def _transcribe_window(audio: AudioSegment, offset_ms: int = 0) -> list[dict]:
+    model = _get_model()
+    segments, _ = model.transcribe(
+        _audio_to_array(audio),
+        language="ar",
+        task="transcribe",
+        beam_size=_BEAM_SIZE,
+        word_timestamps=True,
+        condition_on_previous_text=False,
+        vad_filter=False,
+    )
+
+    words: list[dict] = []
+    prev_end_ms = offset_ms
+    for segment in segments:
+        segment_words = getattr(segment, "words", None) or []
+        for word in segment_words:
+            text = (getattr(word, "word", "") or "").strip()
+            if not text:
+                continue
+
+            start_s = getattr(word, "start", None)
+            end_s = getattr(word, "end", None)
+            start_ms = int(round(start_s * 1000)) + offset_ms if start_s is not None else prev_end_ms
+            end_ms = int(round(end_s * 1000)) + offset_ms if end_s is not None else start_ms + 200
+            if end_ms <= start_ms:
+                end_ms = start_ms + 50
+
+            words.append({"word": text, "start_ms": start_ms, "end_ms": end_ms})
+            prev_end_ms = end_ms
+
+    return words
+
+
+def transcribe_words(audio: AudioSegment, progress_cb=None) -> list[dict]:
     """Transcribe the full audio and return a flat list of word records.
 
     Each record: {"word": str, "start_ms": int, "end_ms": int}
     """
-    samples = _audio_to_array(audio)
-    pipe = _get_pipeline()
+    total_ms = len(audio)
+    if total_ms <= 0:
+        if progress_cb:
+            progress_cb(1, 1)
+        return []
 
-    result = pipe({"array": samples, "sampling_rate": _SAMPLE_RATE})
+    if total_ms <= _SEGMENT_KEEP_MS + _SEGMENT_OVERLAP_MS:
+        words = _transcribe_window(audio)
+        if progress_cb:
+            progress_cb(total_ms, total_ms)
+        return words
 
+    keep_starts = list(range(0, total_ms, _SEGMENT_KEEP_MS))
     words: list[dict] = []
-    prev_end_ms = 0
-    for chunk in result.get("chunks", []) or []:
-        text = (chunk.get("text") or "").strip()
-        ts = chunk.get("timestamp") or (None, None)
-        start_s, end_s = ts[0], ts[1]
-        if not text:
-            continue
-        start_ms = int(round(start_s * 1000)) if start_s is not None else prev_end_ms
-        end_ms = int(round(end_s * 1000)) if end_s is not None else start_ms + 200
-        if end_ms <= start_ms:
-            end_ms = start_ms + 50
-        words.append({"word": text, "start_ms": start_ms, "end_ms": end_ms})
-        prev_end_ms = end_ms
+
+    for segment_index, keep_start in enumerate(keep_starts):
+        keep_end = min(total_ms, keep_start + _SEGMENT_KEEP_MS)
+        segment_start = max(0, keep_start - (0 if keep_start == 0 else _SEGMENT_OVERLAP_MS))
+        segment_end = min(
+            total_ms,
+            keep_end + (_SEGMENT_OVERLAP_MS if keep_end < total_ms else 0),
+        )
+
+        segment_audio = audio[segment_start:segment_end]
+        segment_words = _transcribe_window(segment_audio, offset_ms=segment_start)
+
+        for word in segment_words:
+            midpoint_ms = (word["start_ms"] + word["end_ms"]) // 2
+            if keep_start <= midpoint_ms < keep_end or (
+                segment_index == len(keep_starts) - 1 and midpoint_ms == total_ms
+            ):
+                words.append(word)
+
+        if progress_cb:
+            progress_cb(keep_end, total_ms)
 
     return words

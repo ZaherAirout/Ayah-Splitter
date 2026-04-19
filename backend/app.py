@@ -2,7 +2,10 @@
 
 import os
 import json
+import threading
 import traceback
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
@@ -24,6 +27,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Session state
 session_timings: dict[int, list[dict]] = {}
 session_uploads: set[int] = set()  # Track which surahs were uploaded this session
+analyze_jobs: dict[str, dict] = {}
+analyze_jobs_lock = threading.Lock()
+ANALYZE_JOB_TTL = timedelta(hours=6)
 
 
 @app.route("/")
@@ -109,6 +115,165 @@ def upload_folder():
     return jsonify({"success": True, "uploaded_surahs": sorted(uploaded)})
 
 
+def _build_analysis_response(surah_number: int, result: dict) -> dict:
+    text = get_surah_text(surah_number)
+    return {
+        "surah": surah_number,
+        "surah_name": SURAH_NAMES[surah_number],
+        "duration_ms": result["duration_ms"],
+        "num_ayahs": result["num_ayahs"],
+        "silences": result["silences"],
+        "timings": result["timings"],
+        "ayah_text": text,
+        "basmallah_detected": result.get("basmallah_detected"),
+        "basmallah_transcription": result.get("basmallah_transcription"),
+        "basmallah_method": result.get("basmallah_method"),
+        "basmallah_confidence": result.get("basmallah_confidence"),
+        "debug": result.get("debug"),
+    }
+
+
+def _prune_analyze_jobs():
+    cutoff = datetime.now(timezone.utc) - ANALYZE_JOB_TTL
+    stale = [
+        job_id
+        for job_id, job in analyze_jobs.items()
+        if job.get("updated_at", datetime.now(timezone.utc)) < cutoff
+    ]
+    for job_id in stale:
+        analyze_jobs.pop(job_id, None)
+
+
+def _update_analyze_job(job_id: str, **updates):
+    with analyze_jobs_lock:
+        job = analyze_jobs.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = datetime.now(timezone.utc)
+
+
+def _run_analyze_job(
+    job_id: str,
+    filepath: str,
+    surah_number: int,
+    trim_start: int,
+    trim_end: int,
+    basmallah_mode: str,
+    manual_basmallah_end_ms: int | None,
+):
+    try:
+        _update_analyze_job(job_id, status="running", progress=1, message="Queued")
+
+        def progress_cb(progress: int, message: str):
+            _update_analyze_job(
+                job_id,
+                status="running",
+                progress=max(1, min(99, int(progress))),
+                message=message,
+            )
+
+        result = analyze_surah(
+            filepath,
+            surah_number,
+            trim_start_ms=trim_start,
+            trim_end_ms=trim_end,
+            basmallah_mode=basmallah_mode,
+            manual_basmallah_end_ms=manual_basmallah_end_ms,
+            progress_cb=progress_cb,
+        )
+        session_timings[surah_number] = result["timings"]
+        payload = _build_analysis_response(surah_number, result)
+        _update_analyze_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="Done",
+            result=payload,
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        _update_analyze_job(
+            job_id,
+            status="failed",
+            message="Analysis failed",
+            error=str(exc),
+        )
+
+
+@app.route("/api/analyze-jobs/<int:surah_number>", methods=["POST"])
+def start_analyze_job(surah_number):
+    """Start an async analysis job and return a job id for polling progress."""
+    if surah_number < 1 or surah_number > 114:
+        return jsonify({"error": "Invalid surah number"}), 400
+
+    filepath = os.path.join(UPLOAD_DIR, f"{surah_number:03d}.mp3")
+    if not os.path.exists(filepath):
+        return jsonify({"error": f"Audio file not found for surah {surah_number}"}), 404
+
+    params = request.get_json(silent=True) or {}
+    trim_start = params.get("trim_start_ms", 0)
+    trim_end = params.get("trim_end_ms", 0)
+    basmallah_mode = params.get("basmallah_mode", "auto")
+    manual_basmallah_end_ms = params.get("manual_basmallah_end_ms")
+
+    if basmallah_mode not in {"auto", "present", "absent"}:
+        return jsonify({"error": "Invalid basmallah_mode"}), 400
+
+    job_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    with analyze_jobs_lock:
+        _prune_analyze_jobs()
+        analyze_jobs[job_id] = {
+            "id": job_id,
+            "surah_number": surah_number,
+            "status": "queued",
+            "progress": 0,
+            "message": "Queued",
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    thread = threading.Thread(
+        target=_run_analyze_job,
+        args=(
+            job_id,
+            filepath,
+            surah_number,
+            trim_start,
+            trim_end,
+            basmallah_mode,
+            manual_basmallah_end_ms,
+        ),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"success": True, "job_id": job_id})
+
+
+@app.route("/api/analyze-jobs/<job_id>", methods=["GET"])
+def get_analyze_job(job_id: str):
+    """Return current progress or final result for an analysis job."""
+    with analyze_jobs_lock:
+        job = analyze_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Analyze job not found"}), 404
+
+        payload = {
+            "id": job["id"],
+            "surah_number": job["surah_number"],
+            "status": job["status"],
+            "progress": job.get("progress", 0),
+            "message": job.get("message", ""),
+        }
+        if job["status"] == "completed":
+            payload["result"] = job.get("result")
+        if job["status"] == "failed":
+            payload["error"] = job.get("error", "Analysis failed")
+        return jsonify(payload)
+
+
 @app.route("/api/analyze/<int:surah_number>", methods=["POST"])
 def analyze(surah_number):
     """Analyze a surah audio file and return estimated timings."""
@@ -136,22 +301,7 @@ def analyze(surah_number):
             manual_basmallah_end_ms=manual_basmallah_end_ms,
         )
         session_timings[surah_number] = result["timings"]
-        text = get_surah_text(surah_number)
-
-        return jsonify({
-            "surah": surah_number,
-            "surah_name": SURAH_NAMES[surah_number],
-            "duration_ms": result["duration_ms"],
-            "num_ayahs": result["num_ayahs"],
-            "silences": result["silences"],
-            "timings": result["timings"],
-            "ayah_text": text,
-            "basmallah_detected": result.get("basmallah_detected"),
-            "basmallah_transcription": result.get("basmallah_transcription"),
-            "basmallah_method": result.get("basmallah_method"),
-            "basmallah_confidence": result.get("basmallah_confidence"),
-            "debug": result.get("debug"),
-        })
+        return jsonify(_build_analysis_response(surah_number, result))
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500

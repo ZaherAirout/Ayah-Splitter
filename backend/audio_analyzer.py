@@ -31,6 +31,15 @@ _AYAH_WORD_COUNTS: dict[int, list[int]] = {
 _WORD_RE = re.compile(r"[0-9A-Za-z\u0621-\u063a\u0641-\u064a]+")
 
 
+def _format_ms_clock(value_ms: int) -> str:
+    total_seconds = max(0, int(value_ms // 1000))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 def load_audio(filepath: str) -> AudioSegment:
     return AudioSegment.from_mp3(filepath)
 
@@ -563,8 +572,25 @@ def analyze_surah(
     logger.info(
         f"Surah {surah_number}: transcribing {len(audio_clip)/1000:.1f}s with {MODEL_NAME}"
     )
-    _progress(25, "Transcribing audio with Whisper…")
-    hypothesis = transcribe_words(audio_clip)
+    transcription_state = {"value": 25}
+    _progress(25, "Transcribing audio with Whisper")
+
+    def _set_transcription_progress(pct: int, msg: str):
+        pct = max(transcription_state["value"], pct)
+        transcription_state["value"] = pct
+        _progress(pct, msg)
+
+    def _transcription_progress(done_units: int, total_units: int):
+        if total_units <= 0:
+            return
+        pct = 25 + int((done_units / total_units) * 45)
+        _set_transcription_progress(
+            min(70, pct),
+            f"Transcribing audio {_format_ms_clock(done_units)} / {_format_ms_clock(total_units)}",
+        )
+
+    hypothesis = transcribe_words(audio_clip, progress_cb=_transcription_progress)
+
     _progress(75, "Aligning to reference text")
     # Shift timestamps back to absolute positions
     for w in hypothesis:

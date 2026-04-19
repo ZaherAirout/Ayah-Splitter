@@ -21,6 +21,8 @@ let reflowRequestId = 0;
 let waveformCache = new Map();
 let waveformFetchRequestId = 0;
 let waveformDetailTimer = null;
+let analyzeProgressTimer = null;
+let analyzeProgressValue = 0;
 
 const BASE_WAVEFORM_POINTS = 2000;
 const WAVEFORM_DETAIL_LEVELS = [2000, 4000, 8000, 12000, 16000];
@@ -316,7 +318,7 @@ async function handleFiles(files) {
 
 function addUploadedFile(surah, name, size_mb) {
   uploadedFiles = uploadedFiles.filter(f => f.surah !== surah);
-  uploadedFiles.push({ surah, name, size_mb, status: 'uploaded' });
+  uploadedFiles.push({ surah, name, size_mb, status: 'uploaded', progress: 0 });
   uploadedFiles.sort((a, b) => a.surah - b.surah);
   renderUploadedList();
 }
@@ -324,7 +326,7 @@ function addUploadedFile(surah, name, size_mb) {
 async function refreshUploadedList() {
   const res = await fetch(`${API}/api/uploaded-surahs`);
   const data = await res.json();
-  uploadedFiles = data.surahs.map(s => ({ surah: s.surah, name: s.name, size_mb: s.size_mb, status: s.analyzed ? 'analyzed' : 'uploaded' }));
+  uploadedFiles = data.surahs.map(s => ({ surah: s.surah, name: s.name, size_mb: s.size_mb, status: s.analyzed ? 'analyzed' : 'uploaded', progress: 0 }));
   renderUploadedList();
 }
 
@@ -337,13 +339,53 @@ function renderUploadedList() {
   list.classList.remove('hidden');
   list.innerHTML = uploadedFiles.map(f => {
     const cls = f.status === 'analyzing' ? 'analyzing' : f.status === 'analyzed' ? 'analyzed' : 'pending';
-    const txt = f.status === 'analyzing' ? '<span class="spinner"></span> Analyzing' : f.status === 'analyzed' ? 'Ready' : 'Uploaded';
+    const progress = Number.isFinite(f.progress) ? Math.round(f.progress) : 0;
+    const txt = f.status === 'analyzing'
+      ? `<span class="spinner"></span> ${progress}%`
+      : f.status === 'analyzed'
+        ? 'Ready'
+        : 'Uploaded';
     const active = currentSurah === f.surah ? 'active' : '';
     return `<button type="button" class="file-item ${active}" onclick="openUploadedSurah(${f.surah})"><span class="file-main"><strong>${f.surah}</strong><span>${f.name}</span><small>${f.size_mb} MB</small></span><span class="file-status ${cls}">${txt}</span></button>`;
   }).join('');
 }
 
-function setFileStatus(s, st) { const f = uploadedFiles.find(x => x.surah === s); if (f) { f.status = st; renderUploadedList(); } }
+function setFileStatus(s, st, progress = null) {
+  const f = uploadedFiles.find(x => x.surah === s);
+  if (f) {
+    f.status = st;
+    if (progress != null) f.progress = progress;
+    else if (st !== 'analyzing') f.progress = 0;
+    renderUploadedList();
+  }
+}
+
+function updateAnalyzeButton(progress, message = 'Analyzing') {
+  const btn = document.getElementById('btn-analyze-surah');
+  if (btn.disabled) {
+    btn.textContent = `${Math.round(progress)}%`;
+    btn.title = message;
+  }
+}
+
+function setAnalyzeProgress(progress, message = 'Analyzing') {
+  analyzeProgressValue = Math.max(0, Math.min(100, Math.round(progress)));
+  updateAnalyzeButton(analyzeProgressValue, message);
+  if (currentSurah) setFileStatus(currentSurah, 'analyzing', analyzeProgressValue);
+}
+
+function startAnalyzeProgress() {
+  clearInterval(analyzeProgressTimer);
+  analyzeProgressTimer = null;
+  setAnalyzeProgress(0, 'Queued');
+}
+
+function stopAnalyzeProgress() {
+  clearInterval(analyzeProgressTimer);
+  analyzeProgressTimer = null;
+  analyzeProgressValue = 0;
+}
+
 function openUploadedSurah(surahNum) {
   document.getElementById('surah-select').value = surahNum;
   loadSurah(surahNum);
@@ -419,15 +461,15 @@ async function loadSurah(surahNum) {
 async function analyzeCurrent() {
   if (!currentSurah) return;
   const btn = document.getElementById('btn-analyze-surah');
-  btn.disabled = true; btn.textContent = 'Analyzing...';
-  setFileStatus(currentSurah, 'analyzing');
+  btn.disabled = true;
+  startAnalyzeProgress();
 
   const basmallahMode = document.getElementById('basmallah-mode').value || 'auto';
   const manualBasmallahValue = document.getElementById('manual-basmallah-end').value;
   const manualBasmallahEndMs = manualBasmallahValue === '' ? null : parseInt(manualBasmallahValue, 10);
 
   try {
-    const res = await fetch(`${API}/api/analyze/${currentSurah}`, {
+    const startRes = await fetch(`${API}/api/analyze-jobs/${currentSurah}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         trim_start_ms: trimStartMs,
@@ -436,18 +478,41 @@ async function analyzeCurrent() {
         manual_basmallah_end_ms: manualBasmallahEndMs,
       }),
     });
-    if (!res.ok) {
-      let message = 'Analysis failed';
-      try {
-        const err = await res.json();
-        if (err.error) message = err.error;
-      } catch {}
+
+    let startData = null;
+    try {
+      startData = await startRes.json();
+    } catch {}
+
+    if (!startRes.ok || !startData?.success || !startData?.job_id) {
+      stopAnalyzeProgress();
+      const message = startData?.error || 'Analysis failed';
       showToast(message, 'error');
       setFileStatus(currentSurah, 'uploaded');
       return;
     }
 
-    const d = await res.json();
+    const jobId = startData.job_id;
+    let d = null;
+
+    while (true) {
+      await new Promise(resolve => setTimeout(resolve, 450));
+      const jobRes = await fetch(`${API}/api/analyze-jobs/${jobId}`);
+      const job = await jobRes.json();
+      if (!jobRes.ok) throw new Error(job.error || 'Analysis failed');
+
+      setAnalyzeProgress(job.progress || 0, job.message || 'Analyzing');
+
+      if (job.status === 'completed') {
+        d = job.result;
+        break;
+      }
+      if (job.status === 'failed') {
+        throw new Error(job.error || 'Analysis failed');
+      }
+    }
+
+    setAnalyzeProgress(100, 'Done');
     currentTimings = d.timings; currentSilences = d.silences || []; currentAyahText = d.ayah_text || {};
     manualAnchorAyahs = new Set();
     if (d.debug) renderDebugPanel(d.debug, d);
@@ -476,8 +541,17 @@ async function analyzeCurrent() {
 
     setFileStatus(currentSurah, 'analyzed');
     renderWaveform(); renderMarkers(); renderTimingTable(); updateTrimOverlays(); highlightActiveRow();
-  } catch (e) { showToast('Error: ' + e.message, 'error'); setFileStatus(currentSurah, 'uploaded'); }
-  finally { btn.disabled = false; btn.textContent = 'Analyze'; }
+  } catch (e) {
+    stopAnalyzeProgress();
+    showToast('Error: ' + e.message, 'error');
+    setFileStatus(currentSurah, 'uploaded');
+  }
+  finally {
+    stopAnalyzeProgress();
+    btn.disabled = false;
+    btn.textContent = 'Analyze';
+    btn.title = 'Analyze';
+  }
 }
 
 // ── Save to localStorage ────────────────────────────────────────────

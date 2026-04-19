@@ -2,13 +2,10 @@ FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Install PyTorch CPU-only first (avoids pulling large CUDA packages)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 # Install remaining Python dependencies
 COPY backend/requirements.txt .
