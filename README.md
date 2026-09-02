@@ -2,6 +2,16 @@
 
 Ayah Splitter is a browser-based tool for finding and editing ayah boundaries in Quran recitation MP3 files. It combines a Quran-tuned Whisper model, canonical text alignment, and silence detection, then exports the reviewed timestamps as a SQLite database compatible with [quran_android](https://github.com/quran/quran_android).
 
+## Screenshots
+
+### Dashboard
+
+![Ayah Splitter upload and export dashboard](docs/images/ayah-splitter-home.jpg)
+
+### Waveform editor
+
+![Ayah Splitter waveform editor with Al-Fatiha loaded](docs/images/ayah-splitter-editor.jpg)
+
 ## Features
 
 - Upload one surah or a batch of MP3 files named `1.mp3` through `114.mp3`
@@ -55,6 +65,7 @@ ayah-splitter/
 │   └── static/                # Browser JavaScript and CSS
 ├── audio_input/               # Local MP3 input (not committed)
 ├── output/                    # Generated databases (not committed)
+├── docs/images/               # README screenshots
 ├── Dockerfile
 └── docker-compose.yml
 ```
