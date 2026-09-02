@@ -1,10 +1,28 @@
+# macOS
+.DS_Store
+
+# Editors and IDEs
+.idea/
+.vscode/
+
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local configuration
 .env
-audio_input/*.mp3
-output/
+.env.*
+!.env.example
+
+# Runtime data and generated exports
+audio_input/*
+!audio_input/.gitkeep
+output/*
+!output/.gitkeep
 *.db
 *.db.zip
-.DS_Store
-.idea
